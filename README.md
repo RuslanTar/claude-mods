@@ -50,9 +50,19 @@ Handoffs are written to `thoughts/shared/handoffs/` of the project.
 
 ```
 /autopilot <time> <threshold%> [max restarts] "<role>" [--goal "<condition>"] [--5h 95] [--week 80] [--ask-user]
+/autopilot until <clock> <threshold%> [max restarts] "<role>" [flags]   # same start, ending at a local time
 /autopilot                 # status
+/autopilot extend [<time>] [--restarts N]   # add time and/or restarts
+/autopilot shorten [<time>] [--restarts N]  # take time and/or restarts off
+/autopilot until HH:MM     # end at a local time
 /autopilot 0 0 stop        # hand the wheel back (also clears the goal)
 ```
+
+`extend`, `shorten` and `until` only work when you type them (in the prompt or over Remote Control), never from the session itself. Give a time, `--restarts N` (1–99), or both. With a limited run, `--restarts` raises or lowers the max restarts by N (lowering never goes below the restarts already used). With an unlimited run, `extend --restarts N` allows N more restarts from now, and `shorten --restarts` is ignored (the reply says so).
+
+A run that ended on time is brought back by extending its time. A run that ended on restarts is brought back by raising the limit while there is time left. Anything else (goal met, weekly limit, work complete) is not revived. The change is refused when the new end would be in the past, less than 1 minute ahead, or more than 7 days ahead.
+
+A run that finished on time or on restarts is kept for 15 minutes. In that time `/autopilot` says so, and `extend`, `shorten --restarts` or `until` bring it back: the session clears and resumes from the handoff it already wrote, through a restart that is not counted against the restarts. If the session does not restart after being asked once more, the run pauses and says so; the handoff it restarts from must be newer than the moment the run began finishing. After a goal, the weekly limit or a work-complete finish, or after `/autopilot 0 0 stop`, nothing is kept. `<clock>` (for `until`, as a start and as a change) is 24-hour `18:30` or `7:30`, or 12-hour with am/pm and no space, any case: `6pm`, `6:30pm`, `12am` (midnight), `12pm` (noon). It is the next time the local clock reads that, always under 24 hours ahead. `until <clock>` alone changes the end of the running session; followed by a threshold and role it starts a run. `until` needs the machine's time zone; when it cannot be read, use `extend` or `shorten`.
 
 Example, a night run:
 

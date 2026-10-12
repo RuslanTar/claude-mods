@@ -1,4 +1,4 @@
-import type { Awaiting, Command, FinalReason, Phase, Run, TokenWindow, WaitReason } from '../types'
+import type { Awaiting, Command, FinalReason, FinishedRecord, Phase, Run, StartCommand, TokenWindow, WaitReason } from '../types'
 
 export const RESTART_TOOL = 'restart_session'
 export const WAIT_TOOL = 'wait_for'
@@ -60,11 +60,259 @@ export function effectiveTrigger(run: Run, ceiling: number): number {
 
 /** "90m", "2h", "1h30m", "45" (minutes) → milliseconds; null when unreadable. */
 export function parseDuration(text: string): number | null {
+  const ms = durationMs(text)
+  if (ms === null || !Number.isFinite(ms)) return null
+
+  return ms
+}
+
+function durationMs(text: string): number | null {
   if (/^\d+$/.test(text)) return Number(text) * 60_000
   const match = /^(?:(\d+)h)?(?:(\d+)m)?$/.exec(text)
   if (!match || (!match[1] && !match[2])) return null
 
   return (Number(match[1] ?? 0) * 60 + Number(match[2] ?? 0)) * 60_000
+}
+
+/** A moved end must stay at least this far ahead of now. */
+const MIN_LEAD_MS = 60_000
+
+/** How long after finishing on time or restarts the person can still bring a run back. */
+export const GRACE_MS = 15 * 60_000
+
+/** Whether a run that finished for this reason can be brought back (a time-out or used-up restarts only). */
+export function isGraceEligible(reason: FinalReason | null): boolean {
+  return reason === 'time' || reason === 'restarts'
+}
+
+export function isGraceLive(record: FinishedRecord, now: number): boolean {
+  return now - record.finishedAt <= GRACE_MS
+}
+
+/** Whether a stored `finished:` value is a record still inside its grace period; anything malformed is not. */
+export function isLiveFinishedValue(value: unknown, now: number): boolean {
+  if (typeof value !== 'object' || value === null) return false
+  const finishedAt = (value as { finishedAt?: unknown }).finishedAt
+  if (typeof finishedAt !== 'number' || !Number.isFinite(finishedAt)) return false
+
+  return isGraceLive(value as FinishedRecord, now)
+}
+
+/** What `/autopilot` says when there is no run but a finished one can still be brought back. */
+export function graceStatusText(record: FinishedRecord, now: number): string {
+  const minutesLeft = Math.max(0, Math.ceil((GRACE_MS - (now - record.finishedAt)) / 60_000))
+
+  const ask = record.run.finalReason === 'restarts' ? 'extend --restarts N' : 'extend <time>'
+
+  return `Autopilot finished (${record.run.finalReason}) at ${endClock(record.finishedAt, null)}; /autopilot ${ask} within ${minutesLeft}m brings it back from its handoff.`
+}
+
+/** How many times a grace resume asks the session to restart before it gives up. */
+const MAX_GRACE_ASKS = 1
+
+/**
+ * What a finished main-loop turn means for a grace resume that is still
+ * waiting for its restart: ask once more, or pause. Any
+ * other run (an ordinary wrap-up included) is none of its business.
+ */
+export function graceTurnAction(run: Run): 'none' | 'ask' | 'pause' {
+  if (run.phase !== 'wrapping' || !run.isGraceResume) return 'none'
+
+  return (run.graceAsks ?? 0) < MAX_GRACE_ASKS ? 'ask' : 'pause'
+}
+
+/**
+ * Whether a grace resume's handoff is the current one: written at or after the
+ * final phase began (`ok`), older or unreadable (`stale`), or no start time to
+ * compare with (`unknown`, which fails closed).
+ */
+export function graceHandoffCheck(mtimeMs: number | null, since: number | undefined): 'ok' | 'stale' | 'unknown' {
+  if (since === undefined) return 'unknown'
+
+  return mtimeMs !== null && mtimeMs >= since ? 'ok' : 'stale'
+}
+
+/** The handoff path a restart call carries: `handoffPath`, or `handoff_path` when the model guessed that name; "" when neither. */
+export function handoffArg(input: unknown): string {
+  const fields = (typeof input === 'object' && input !== null ? input : {}) as { handoffPath?: unknown; handoff_path?: unknown }
+
+  return String(fields.handoffPath ?? fields.handoff_path ?? '')
+}
+
+/** The prompt that makes a finished run restart from the handoff it already wrote. */
+export function graceResumePrompt(until: number, offsetMinutes: number | null): string {
+  return `Autopilot: the person brought this run back until ${endClock(until, offsetMinutes)}. Call ${RESTART_TOOL} with {"handoffPath": "<path to the handoff .md>"}, the handoff you just wrote under thoughts/shared/handoffs/; autopilot will clear the session and resume from it. Do not start other work first.`
+}
+
+/** The most restarts a limit may reach. */
+const MAX_RESTARTS = 99
+
+/** The furthest the end of a run may be moved ahead of now. */
+export const MAX_AHEAD_MS = 7 * 24 * 60 * 60_000
+
+/** "18:30", "7:30" (24-hour) or "6pm", "6:30pm", "12am" (12-hour, no space, any case) → hours and minutes; null when unreadable. */
+export function parseClock(text: string): { hours: number; minutes: number } | null {
+  const match = /^(\d{1,2})(?::(\d{2}))?(am|pm)?$/i.exec(text)
+  if (!match) return null
+  const hours = Number(match[1])
+  const minutes = Number(match[2] ?? 0)
+  const suffix = match[3]?.toLowerCase()
+  if (minutes > 59) return null
+  if (!suffix) return match[2] === undefined || hours > 23 ? null : { hours, minutes }
+  if (hours < 1 || hours > 12) return null
+
+  return { hours: (hours % 12) + (suffix === 'pm' ? 12 : 0), minutes }
+}
+
+/** `date +%z` output ("+0300", "-0530") → minutes east of UTC; null when unreadable. */
+export function parseUtcOffset(text: string): number | null {
+  const match = /^([+-])(\d{2})(\d{2})$/.exec(text.trim())
+  if (!match) return null
+  const minutes = Number(match[2]) * 60 + Number(match[3])
+
+  return match[1] === '-' ? -minutes : minutes
+}
+
+/**
+ * The next instant strictly after `now` whose local clock (UTC + offset) reads hours:minutes.
+ * Today's offset is applied: a DST switch before the target shifts it by an hour.
+ */
+export function untilFromClock(hours: number, minutes: number, now: number, offsetMinutes: number): number {
+  const DAY_MS = 24 * 60 * 60_000
+  const localNow = now + offsetMinutes * 60_000
+  const localMidnight = localNow - (((localNow % DAY_MS) + DAY_MS) % DAY_MS)
+  const today = localMidnight + (hours * 60 + minutes) * 60_000 - offsetMinutes * 60_000
+
+  return today > now ? today : today + DAY_MS
+}
+
+export const NOT_RUNNING_TEXT = 'Autopilot is not running. Start a new run: /autopilot <time> <threshold%> "<role>".'
+
+/** Where a change to the run's end and restart limit lands. */
+export type RetimeTarget = { until: number; maxRestarts: number | null }
+
+export type RetimeAction =
+  | ({ kind: 'set' } & RetimeTarget)
+  | ({ kind: 'revive'; phase: 'running' | 'waiting'; waitUntil: number | null } & RetimeTarget)
+  | { kind: 'refuse'; message: string }
+
+type RetimeCommand = Extract<Command, { kind: 'extend' | 'shorten' | 'until' }>
+
+/**
+ * The end and restart limit a retime command asks for, with a note for the
+ * reply when the restarts part changed nothing or hit zero left.
+ */
+export function targetChange(
+  command: RetimeCommand,
+  run: Run,
+  now: number,
+  offset: number | null,
+): (RetimeTarget & { note: string | null }) | { refuse: string } {
+  if (command.kind === 'until') {
+    if (offset === null) return { refuse: 'Cannot read the local time zone; use /autopilot extend or shorten instead.' }
+
+    return { until: untilFromClock(command.hours, command.minutes, now, offset), maxRestarts: run.maxRestarts, note: null }
+  }
+
+  const isExtend = command.kind === 'extend'
+  const isRestartsOnly = command.deltaMs === 0
+  if (isRestartsOnly && run.until <= now && !endsForGood(run)) {
+    return {
+      refuse: isExtend
+        ? "The run's time is over; add time too, e.g. /autopilot extend 1h --restarts N."
+        : "The run's time is over; restarts cannot be changed on a finished time, add time with /autopilot extend.",
+    }
+  }
+  // A restarts-only change leaves the end alone (its past end is refused above); an extend counts from now when the end already passed.
+  const until = isExtend && !isRestartsOnly ? Math.max(run.until, now) + command.deltaMs : run.until - command.deltaMs
+  if (command.restarts === 0) return { until, maxRestarts: run.maxRestarts, note: null }
+
+  if (isExtend) {
+    const raised = (run.maxRestarts ?? run.restarts) + command.restarts
+
+    return { until, maxRestarts: Math.max(run.restarts, Math.min(raised, MAX_RESTARTS)), note: raised > MAX_RESTARTS ? `Restart limit capped at ${MAX_RESTARTS}.` : null }
+  }
+  if (run.maxRestarts === null) {
+    return { until, maxRestarts: null, note: 'Restarts are unlimited in this run; --restarts on shorten was ignored.' }
+  }
+  const lowered = run.maxRestarts - command.restarts
+  const note = lowered <= run.restarts ? `No restarts left after this change (${run.restarts} used).` : null
+
+  return { until, maxRestarts: Math.max(run.restarts, lowered), note }
+}
+
+const FINAL_REASON_TEXT: Record<string, string> = {
+  goal: 'its goal is met',
+  week: 'the weekly token limit was reached',
+  restarts: 'it used all its restarts',
+  done: 'the session reported its work complete',
+}
+
+/**
+ * What moving the run to `target` does: set it, bring a finished run back
+ * (a time-out, or an exhausted restart limit that was raised, with time left),
+ * or refuse. `limit` is what the token windows call for now (limitAction): a
+ * revive is refused at the weekly stop, and lands in `waiting` while a 5-hour
+ * wait is pending or the 5-hour window is at its stop.
+ */
+export function retime(run: Run | null, target: RetimeTarget, now: number, limit: LimitAction = null): RetimeAction {
+  if (!run) return { kind: 'refuse', message: NOT_RUNNING_TEXT }
+  if (!Number.isFinite(target.until) || target.until - now > MAX_AHEAD_MS) {
+    return { kind: 'refuse', message: 'The end can be at most 7 days from now.' }
+  }
+  const isFinal = run.phase === 'final'
+  if (endsForGood(run)) return { kind: 'refuse', message: finishingText(run.finalReason) }
+  if (target.until <= now) {
+    return { kind: 'refuse', message: 'The new end would be in the past. To hand back now: /autopilot 0 0 stop.' }
+  }
+  if (target.until - now < MIN_LEAD_MS) {
+    return { kind: 'refuse', message: 'The new end must be at least 1 minute ahead. To hand back now: /autopilot 0 0 stop.' }
+  }
+  const { until, maxRestarts } = target
+  if (!isFinal) return { kind: 'set', until, maxRestarts }
+  const isRestartsRaised = target.maxRestarts === null || target.maxRestarts > run.restarts
+  if (run.finalReason === 'restarts' && !isRestartsRaised) return { kind: 'refuse', message: finishingText('restarts') }
+
+  if (limit?.kind === 'week') {
+    return { kind: 'refuse', message: `The weekly token limit is at its stop (${run.weekStop}%); the run cannot continue.` }
+  }
+  if (limit?.kind === 'five-hour') return { kind: 'revive', phase: 'waiting', waitUntil: limit.waitUntil, until, maxRestarts }
+  if (run.waitUntil && run.waitUntil > now) return { kind: 'revive', phase: 'waiting', waitUntil: run.waitUntil, until, maxRestarts }
+
+  return { kind: 'revive', phase: 'running', waitUntil: null, until, maxRestarts }
+}
+
+/** A final handoff that more time or restarts cannot undo (anything but a time-out or used-up restarts). */
+function endsForGood(run: Run): boolean {
+  return run.phase === 'final' && run.finalReason !== 'time' && run.finalReason !== 'restarts'
+}
+
+function finishingText(reason: FinalReason | null): string {
+  const reasonText = (reason && FINAL_REASON_TEXT[reason]) || 'it is wrapping up'
+
+  return `Autopilot is finishing because ${reasonText}; more time does not change that. Start a new run after it hands back.`
+}
+
+/** `HH:MM (HH:MM UTC)` on the clock `offsetMinutes` east of UTC, or `HH:MM UTC` when the offset is unknown. */
+export function endClock(until: number, offsetMinutes: number | null): string {
+  const utc = new Date(until).toISOString().slice(11, 16)
+  if (offsetMinutes === null) return `${utc} UTC`
+
+  return `${new Date(until + offsetMinutes * 60_000).toISOString().slice(11, 16)} (${utc} UTC)`
+}
+
+/**
+ * The prompt that brings a finished run back to work. `restarts` is given when
+ * the run was revived from used-up restarts: the text then names them, not the time.
+ */
+export function revivePrompt(until: number, offsetMinutes: number | null, restarts?: { used: number; limit: number | null }): string {
+  const tail = 'The final handoff is cancelled: do not write it now. Keep working within your role.'
+  const when = endClock(until, offsetMinutes)
+  if (restarts) {
+    return `Autopilot: the person added restarts (now ${restarts.used}/${restarts.limit ?? 'unlimited'}); the run continues until ${when}. ${tail}`
+  }
+
+  return `Autopilot: the person extended this run until ${when}. ${tail}`
 }
 
 /** Takes `--name value` out of the arguments; a quoted value may hold spaces. */
@@ -164,7 +412,7 @@ function flagsOnlyFrom(text: string): Uint8Array {
  * is not quoted.
  */
 function splitQuotedRole(text: string): { head: string; rest: string } | null {
-  const match = /^\S+\s+\d{1,3}%?\s+(?:\d{1,2}\s+)?(["“«'])/.exec(text)
+  const match = /^(?:until\s+)?\S+\s+\d{1,3}%?\s+(?:\d{1,2}\s+)?(["“«'])/i.exec(text)
   if (!match) return null
   const opener = match[1] ?? ''
   const closer = ROLE_QUOTES[opener] ?? opener
@@ -178,7 +426,18 @@ function splitQuotedRole(text: string): { head: string; rest: string } | null {
 }
 
 const USAGE =
-  'Usage: /autopilot <time> <threshold%> [max restarts] "<role>" [--goal "<condition>"] [--5h 95] [--week 80] [--ask-user]  ·  /autopilot 0 0 stop'
+  'Usage: /autopilot <time | until <clock>> <threshold%> [max restarts] "<role>" [--goal "<condition>"] [--5h 95] [--week 80] [--ask-user]  ·  /autopilot extend [<time>] [--restarts N]  ·  /autopilot shorten [<time>] [--restarts N]  ·  /autopilot until HH:MM  ·  /autopilot 0 0 stop'
+const MAX_ECHOED = 40
+
+/** The person's raw text as an error reply shows it: invisible characters out, capped at 40 characters. */
+function echoed(raw: string): string {
+  const text = raw.replace(INVISIBLE_ALL, '')
+
+  return text.length > MAX_ECHOED ? `${text.slice(0, MAX_ECHOED)}…` : text
+}
+
+const CLOCK_TEXT ='Give the end as HH:MM (24-hour) or with am/pm, e.g. until 18:30 or until 6:30pm (local time).'
+const RESTARTS_FLAG_TEXT = '--restarts needs a whole number from 1 to 99.'
 
 /**
  * `/autopilot` arguments: nothing (status), `stop` or `0 0 stop`, or
@@ -187,10 +446,56 @@ const USAGE =
  * restarts as the time allows.
  */
 export function parseCommand(args: string): Command {
-  let text = args.trim()
+  const text = args.trim()
   if (!text) return { kind: 'status' }
   if (/^(0\s+0\s+)?stop$/i.test(text)) return { kind: 'stop' }
 
+  const dashed = /^--(extend|shorten|until)\b\s*(.*)$/i.exec(text)
+  if (dashed) {
+    const rest = echoed((dashed[2] ?? '').trim())
+
+    return { kind: 'error', message: `Did you mean /autopilot ${dashed[1]?.toLowerCase()}${rest ? ` ${rest}` : ''}?` }
+  }
+  const retimeMatch = /^(extend|shorten)(?:\s+([\s\S]*))?$/i.exec(text)
+  if (retimeMatch) {
+    const kind = retimeMatch[1]?.toLowerCase() === 'extend' ? 'extend' : 'shorten'
+    const usage = { kind: 'error', message: `Usage: /autopilot ${kind} [<time>] [--restarts N]` } as const
+    const restartsFlag = takeFlag(retimeMatch[2] ?? '', 'restarts')
+    const rawTime = restartsFlag.rest
+    const restarts = restartsFlag.value === null ? 0 : Number(restartsFlag.value)
+    if (restartsFlag.value !== null && (!/^\d{1,2}$/.test(restartsFlag.value) || restarts < 1)) {
+      return { kind: 'error', message: RESTARTS_FLAG_TEXT }
+    }
+    if (/\s|^--/.test(rawTime)) return usage
+    if (!rawTime && restarts === 0) return usage
+    if (!rawTime) return { kind, deltaMs: 0, restarts }
+
+    const deltaMs = parseDuration(rawTime)
+    if (deltaMs === null || deltaMs <= 0) {
+      return { kind: 'error', message: `Cannot read the time "${echoed(rawTime)}" (try 90m, 2h, 1h30m).` }
+    }
+
+    return { kind, deltaMs, restarts }
+  }
+  if (/^until$/i.test(text)) return { kind: 'error', message: 'Usage: /autopilot until HH:MM' }
+  if (/^until\s/i.test(text) && /\s--restarts(?=\s|$)/i.test(text)) {
+    return { kind: 'error', message: 'until takes no --restarts; use /autopilot extend --restarts N.' }
+  }
+  // `until <clock>` alone moves the end; with more after it, it is a start with an end time.
+  const untilMatch = /^until\s+(\S+)$/i.exec(text)
+  if (untilMatch) {
+    const clock = parseClock(untilMatch[1] ?? '')
+    if (!clock) return { kind: 'error', message: CLOCK_TEXT }
+
+    return { kind: 'until', ...clock }
+  }
+
+  return parseStart(text)
+}
+
+/** A start: `<time | until <clock>> <threshold%> [max restarts] "<role>"` with the flags anywhere outside the role. */
+function parseStart(args: string): Command {
+  let text = args
   // Flags are read only outside a quoted role: a role may not carry its own --goal.
   const quoted = splitQuotedRole(text)
   let flagText = quoted ? quoted.rest : text
@@ -212,13 +517,16 @@ export function parseCommand(args: string): Command {
   const goal = goalFlag.value?.trim() || null
   if (goalFlag.value !== null && !goal) return { kind: 'error', message: '--goal needs a condition in quotes.' }
 
-  const match = /^(\S+)\s+(\d{1,3})%?\s+(?:(\d{1,2})\s+)?(["'“«][\s\S]+|[^\d\s][\s\S]*)$/.exec(text)
+  const match = /^(?:until\s+(\S+)|(?!until\s)(\S+))\s+(\d{1,3})%?\s+(?:(\d{1,2})\s+)?(["'“«][\s\S]+|[^\d\s][\s\S]*)$/i.exec(text)
   if (!match) return { kind: 'error', message: USAGE }
-  const [, rawDuration = '', rawThreshold = '', rawRestarts, rawRole = ''] = match
-  const durationMs = parseDuration(rawDuration)
-  if (durationMs === null || durationMs <= 0) {
-    return { kind: 'error', message: `Cannot read the time "${rawDuration}" (try 90m, 2h, 1h30m).` }
+  const [, rawClock, rawDuration = '', rawThreshold = '', rawRestarts, rawRole = ''] = match
+  const clock = rawClock === undefined ? null : parseClock(rawClock)
+  if (rawClock !== undefined && !clock) return { kind: 'error', message: CLOCK_TEXT }
+  const ms = parseDuration(rawDuration)
+  if (!clock && (ms === null || ms <= 0)) {
+    return { kind: 'error', message: `Cannot read the time "${echoed(rawDuration)}" (try 90m, 2h, 1h30m).` }
   }
+  const end: StartCommand['end'] = clock ? { kind: 'clock', ...clock } : { kind: 'duration', ms: ms ?? 0 }
   const threshold = Number(rawThreshold)
   if (threshold < 1 || threshold > 95) return { kind: 'error', message: 'The context threshold must be between 1 and 95 (%).' }
   const role = rawRole.trim().replace(/^["'“«]|["'”»]$/g, '').trim()
@@ -228,7 +536,7 @@ export function parseCommand(args: string): Command {
 
   return {
     kind: 'start',
-    durationMs,
+    end,
     threshold,
     maxRestarts: rawRestarts === undefined ? null : Number(rawRestarts),
     role,
@@ -578,6 +886,7 @@ export function resolveHandoffPath(root: string, path: string): string {
 }
 
 export function formatLeft(ms: number): string {
+  if (ms < 60_000) return `${Math.max(0, Math.round(ms / 1000))}s`
   const minutes = Math.max(0, Math.round(ms / 60_000))
   if (minutes < 60) return `${minutes}m`
 
@@ -667,7 +976,7 @@ export function wrapupPrompt(run: Run, percent: number | null): string {
     '2. Use the /create-handoff-doc skill. Put this block at the very top of the handoff, verbatim, as the initial prompt of the next session, marked as important and not to be ignored:',
     identityLines(run),
     '   Then: the goal of the next stage (you may refine it), what is done, what is next, the decisions you made yourself, and the deferred actions waiting for the person.',
-    `3. Call the ${RESTART_TOOL} tool with the path of the handoff document. It clears this session and resumes from the handoff.`,
+    `3. Call ${RESTART_TOOL} with {"handoffPath": "<path to the handoff .md>"}. It clears this session and resumes from the handoff.`,
   ].join('\n')
 }
 

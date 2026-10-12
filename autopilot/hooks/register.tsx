@@ -1,11 +1,12 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { FinalReason, Run, TokenWindow } from '../types'
+import type { FinalReason, FinishedRecord, Run, TokenWindow } from '../types'
 import {
   CONTINUE_PROMPT,
   DEFAULT_CEILING,
   DEFERRED_NOTE,
   FULL_WAIT_TOOL,
+  NOT_RUNNING_TEXT,
   RESTART_TOOL,
   RESUME_AFTER_WAIT_PROMPT,
   WAIT_REASONS,
@@ -14,25 +15,39 @@ import {
   askAnswer,
   autoAnswersQuestions,
   effectiveTrigger,
+  endClock,
   endsWait,
   finalPrompt,
   followsNewSessionId,
   formatLeft,
   goalState,
   goalVerdictsFromRows,
+  graceResumePrompt,
+  graceHandoffCheck,
+  graceStatusText,
+  graceTurnAction,
+  handoffArg,
   identityFromRows,
   isDoneAnswer,
+  isGraceEligible,
+  isGraceLive,
+  isLiveFinishedValue,
   isValidHandoffPath,
   kickoffPrompt,
   limitAction,
   namedSkills,
   parseCommand,
+  parseUtcOffset,
   parseWaitInput,
   resolveHandoffPath,
   restartsText,
+  retime,
+  revivePrompt,
   roleSection,
   shouldDropStopBlock,
+  targetChange,
   triggerCeiling,
+  untilFromClock,
   waitPhaseRefusal,
   waitPrompt,
   waitRefusal,
@@ -77,8 +92,41 @@ async function readCeiling($: EngineInterface): Promise<number> {
 }
 
 const storeKey = (id: string) => `run:${id}`
-const autopilotDir = () => `${home}/.claude/autopilot`
-const clockTime = (ms: number) => new Date(ms).toISOString().slice(11, 16)
+const finishedKey = (id: string) => `finished:${id}`
+
+/** The record of a run that finished on time or restarts, while the grace period lasts; an expired one is deleted. */
+async function loadFinished($: EngineInterface, now: number): Promise<FinishedRecord | null> {
+  if (!sessionId) return null
+  const record = ((await $.store.get(finishedKey(sessionId))) as FinishedRecord | undefined) ?? null
+  if (!record) return null
+  if (isGraceLive(record, now)) return record
+  await $.store.delete(finishedKey(sessionId)).catch(() => undefined)
+
+  return null
+}
+
+/** Deletes every finished-run record, of any session, that is past its grace period or malformed. */
+async function sweepFinished($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith('finished:')) continue
+    const value = await $.store.get(key)
+    if (!isLiveFinishedValue(value, now)) await $.store.delete(key)
+  }
+}
+
+const autopilotDir =() => `${home}/.claude/autopilot`
+
+/** The machine's UTC offset in minutes east of UTC (`date +%z`); null when it cannot be read. */
+async function utcOffset($: EngineInterface): Promise<number | null> {
+  try {
+    const result = await $.process.run(['/bin/date', '+%z'])
+
+    return parseUtcOffset(result.stdout)
+  } catch {
+    return null
+  }
+}
 
 async function save($: EngineInterface): Promise<void> {
   if (!sessionId) return
@@ -243,6 +291,8 @@ async function enterFinal($: EngineInterface, reason: FinalReason): Promise<stri
   run.finalReason = reason
   // A declared wait ends with the run's last stage (the time running out while awaiting).
   run.awaiting = null
+  // The final handoff is written after this moment; a grace resume asks for a handoff newer than it.
+  run.finalAt = await $.clock.now()
   await clearGoal($)
   await save($)
   await log($, `final handoff requested (${reason})`)
@@ -288,7 +338,7 @@ async function applyLimits($: EngineInterface, windows: readonly TokenWindow[], 
   run.waitUntil = action.waitUntil
   await clearGoal($)
   await save($)
-  await log($, `5-hour token window at ${run.fiveHourStop}%+: parked until ${clockTime(action.waitUntil)} UTC`)
+  await log($, `5-hour token window at ${run.fiveHourStop}%+: parked until ${endClock(action.waitUntil, null)}`)
   scheduleWake($, now)
 
   return waitPrompt(run, action.waitUntil)
@@ -328,7 +378,7 @@ function watchGoal($: EngineInterface): void {
 function waitingLines(now: number): string[] {
   const awaiting = run?.awaiting ?? null
   if (run?.phase !== 'awaiting' || !awaiting) return []
-  const check = awaiting.timeoutAt ? ` · checks at ${clockTime(awaiting.timeoutAt)} UTC` : ''
+  const check = awaiting.timeoutAt ? ` · checks at ${endClock(awaiting.timeoutAt, null)}` : ''
 
   return [`Waiting: ${waitText(awaiting, now)}${check}`]
 }
@@ -368,7 +418,7 @@ function statusText(now: number): string {
   if (!run) return 'Autopilot is off.'
 
   return [
-    `Autopilot: ${run.phase}${run.waitUntil ? ` until ${clockTime(run.waitUntil)} UTC` : ''} · ${formatLeft(run.until - now)} left · handoff at ${effectiveTrigger(run, ceiling)}% (asked ${run.threshold}%, ceiling ${ceiling}% below auto-compact) · restarts ${restartsText(run)}`,
+    `Autopilot: ${run.phase}${run.waitUntil ? ` until ${endClock(run.waitUntil, null)}` : ''} · ${formatLeft(run.until - now)} left · handoff at ${effectiveTrigger(run, ceiling)}% (asked ${run.threshold}%, ceiling ${ceiling}% below auto-compact) · restarts ${restartsText(run)}`,
     ...waitingLines(now),
     `Token limits: park at ${run.fiveHourStop}% of the 5-hour window, stop at ${run.weekStop}% of the week`,
     ...(run.askUser === true ? ['Asks the person: critical only'] : []),
@@ -391,11 +441,13 @@ export const register: Register = on => {
     sessionId = await $.session.id()
     run = ((await $.store.get(storeKey(sessionId))) as Run | undefined) ?? null
     await readCeiling($)
+    // Records of runs that finished long ago go; best effort, off the start's path.
+    void sweepFinished($).catch(() => undefined)
 
     await $.command.register({
       name: 'autopilot',
-      description: 'Run this session on autopilot with a fixed role; no args shows status, "0 0 stop" hands back',
-      argumentHint: '<time> <threshold%> [max restarts] "<role>" [--goal "…"] [--5h 95] [--week 80] [--ask-user] | 0 0 stop',
+      description: 'Run this session on autopilot with a fixed role; no args shows status, "extend|shorten [<time>] [--restarts N]" and "until 18:30|6:30pm" change the end, "0 0 stop" hands back',
+      argumentHint: '<time | until 18:30|6:30pm> <threshold%> [max restarts] "<role>" [--goal "…"] [--5h 95] [--week 80] [--ask-user] | extend|shorten [<time>] [--restarts N] | until 18:30|6:30pm | 0 0 stop',
     })
     await $.tool.register({
       name: RESTART_TOOL,
@@ -449,13 +501,131 @@ export const register: Register = on => {
 
   on('command.run', { command: 'autopilot' }, async ($, e) => {
     await syncId($)
-    const now = await $.clock.now()
+    let now = await $.clock.now()
     const command = parseCommand(e.args)
 
-    if (command.kind === 'status') return { text: statusText(now) }
+    if (command.kind === 'status') {
+      const finished = run ? null : await loadFinished($, now)
+
+      return { text: finished ? graceStatusText(finished, now) : statusText(now) }
+    }
     if (command.kind === 'error') return { text: command.message }
+    if (command.kind === 'extend' || command.kind === 'shorten' || command.kind === 'until') {
+      if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') {
+        await log($, `retime refused: origin ${e.origin.kind}`)
+
+        return { text: 'Only the person can change the autopilot end time (type it in the prompt or over Remote Control).' }
+      }
+      // No run, but one that finished on time or restarts a moment ago: it is judged as a run in its final phase.
+      const finished = run ? null : await loadFinished($, now)
+      const subject = run ?? finished?.run ?? null
+      if (!subject) return { text: NOT_RUNNING_TEXT }
+      const offset = await utcOffset($)
+      // The process call took time: decide on the clock as it is now.
+      now = await $.clock.now()
+      // The token windows only matter for a revive: a weekly stop at its limit refuses, a 5-hour stop parks.
+      const usage = subject.phase === 'final' ? await $.session.usage().catch(() => null) : null
+      const target = targetChange(command, subject, now, offset)
+      if ('refuse' in target) return { text: target.refuse }
+      const action = retime(subject, target, now, usage ? limitAction(subject, usage.rateLimits, now) : null)
+      if (action.kind === 'refuse') return { text: action.message }
+
+      const limit = (maxRestarts: number | null) => maxRestarts ?? 'unlimited'
+      const restartsChange = action.maxRestarts === subject.maxRestarts ? '' : `, restart limit ${limit(subject.maxRestarts)} -> ${limit(action.maxRestarts)}`
+      const note = target.note ? ` ${target.note}` : ''
+      if (finished) {
+        // A finished record is final/time or final/restarts, so retime can only revive it.
+        if (action.kind !== 'revive') return { text: NOT_RUNNING_TEXT }
+        // Back through the restart flow: the handoff is already written, so wrapping asks for the restart;
+        // that restart is not counted. The wait is dropped: the limit checks after the resume park it again if needed.
+        run = {
+          ...finished.run,
+          until: action.until,
+          maxRestarts: action.maxRestarts,
+          phase: 'wrapping',
+          finalReason: null,
+          idleTurns: 0,
+          waitUntil: null,
+          isGraceResume: true,
+          graceSince: finished.run.finalAt,
+          graceAsks: 0,
+        }
+        try {
+          await save($)
+        } catch (error) {
+          run = null
+          await save($).catch(() => undefined)
+          await log($, `could not record the change: ${String(error)}`).catch(() => undefined)
+
+          return { text: 'Autopilot could not record the change; nothing changed.' }
+        }
+        await $.store.delete(finishedKey(sessionId)).catch(() => undefined)
+        await log($, `revived after finishing (${finished.run.finalReason}) by ${command.kind}: to ${endClock(run.until, null)}${restartsChange}`)
+        queue($, graceResumePrompt(run.until, offset))
+
+        return {
+          text: `Autopilot end: ${endClock(run.until, offset)}, ${formatLeft(run.until - now)} left, restarts ${run.restarts}/${limit(run.maxRestarts)}.${note} Bringing the run back: the session will clear and resume from its handoff.`,
+        }
+      }
+      // Stopped while the clock and usage were read.
+      if (!run) return { text: NOT_RUNNING_TEXT }
+      const wasReason = run.finalReason
+      const previous = {
+        until: run.until,
+        maxRestarts: run.maxRestarts,
+        phase: run.phase,
+        finalReason: run.finalReason,
+        idleTurns: run.idleTurns,
+        waitUntil: run.waitUntil,
+      }
+      run.until = action.until
+      run.maxRestarts = action.maxRestarts
+      if (action.kind === 'revive') {
+        run.phase = action.phase
+        run.finalReason = null
+        run.idleTurns = 0
+        run.waitUntil = action.waitUntil
+      }
+      try {
+        await save($)
+      } catch (error) {
+        // Not recorded: back to where it was, or the run would differ from what is stored.
+        Object.assign(run, previous)
+        await save($).catch(() => undefined)
+        await log($, `could not record the change: ${String(error)}`).catch(() => undefined)
+
+        return { text: 'Autopilot could not record the change; nothing changed.' }
+      }
+      const logLine = `to ${endClock(run.until, null)}${restartsChange}`
+      const pausedNote = run.phase === 'paused' ? ' (paused; start it again to resume work)' : ''
+      const reply = `Autopilot end: ${endClock(run.until, offset)}, ${formatLeft(run.until - now)} left, restarts ${run.restarts}/${limit(run.maxRestarts)}.${note}${pausedNote}`
+      if (action.kind === 'set') {
+        await log($, `end moved by the person (${command.kind}): ${logLine}`)
+
+        return { text: reply }
+      }
+
+      await log($, `revived from final (${wasReason}) by ${command.kind}: ${logLine}`)
+      // A 5-hour wait is pending (or the window is at its stop): the park's own wake brings the session back.
+      if (action.phase === 'waiting') {
+        await clearGoal($)
+        scheduleWake($, now)
+
+        return { text: `${reply} Back on the 5-hour wait: the final handoff is cancelled.` }
+      }
+      // Setting the goal starts a turn of its own, which already reads the pinned
+      // role: a revive prompt after it would land behind work that may be done by then.
+      if (run.goal) await setGoal($)
+      else {
+        const restarts = wasReason === 'restarts' ? { used: run.restarts, limit: run.maxRestarts } : undefined
+        queue($, revivePrompt(run.until, offset, restarts))
+      }
+
+      return { text: `${reply} Back to work: the final handoff is cancelled.` }
+    }
     if (command.kind === 'stop') {
       if (run) await log($, 'stopped by the person')
+      await $.store.delete(finishedKey(sessionId)).catch(() => undefined)
       await clearGoal($)
       run = null
       await save($)
@@ -463,6 +633,17 @@ export const register: Register = on => {
 
       return { text: 'Autopilot is off. You have the wheel.' }
     }
+
+    // A clock end is under 24 hours ahead, so the 7-day cap cannot be hit.
+    const startOffset = await utcOffset($)
+    now = await $.clock.now()
+    if (command.end.kind === 'clock' && startOffset === null) {
+      return { text: 'Cannot read the local time zone; use a duration such as 2h instead.' }
+    }
+    const until =
+      command.end.kind === 'clock'
+        ? untilFromClock(command.end.hours, command.end.minutes, now, startOffset ?? 0)
+        : now + command.end.ms
 
     const limit = await readCeiling($)
     const capNote =
@@ -477,7 +658,7 @@ export const register: Register = on => {
       name: identity.name,
       color: identity.color,
       startedAt: now,
-      until: now + command.durationMs,
+      until,
       threshold: command.threshold,
       maxRestarts: command.maxRestarts,
       restarts: 0,
@@ -494,9 +675,10 @@ export const register: Register = on => {
       askUser: command.askUser,
     }
     await save($)
+    await $.store.delete(finishedKey(sessionId)).catch(() => undefined)
     await log(
       $,
-      `started: ${formatLeft(command.durationMs)}, trigger ${command.threshold}%, restarts ${restartsText(run)}, 5h ${command.fiveHourStop}%, week ${command.weekStop}%${command.goal ? `, goal: ${command.goal}` : ''}${command.askUser ? ', asks the person: critical only' : ''}; role: ${command.role}`,
+      `started: ${formatLeft(until - now)} (until ${endClock(until, null)}), trigger ${command.threshold}%, restarts ${restartsText(run)}, 5h ${command.fiveHourStop}%, week ${command.weekStop}%${command.goal ? `, goal: ${command.goal}` : ''}${command.askUser ? ', asks the person: critical only' : ''}; role: ${command.role}`,
     )
     if (capNote) await log($, `threshold ${command.threshold}% capped to ${limit}% below auto-compact`)
 
@@ -513,7 +695,7 @@ export const register: Register = on => {
       })()
     })
 
-    return { text: `${statusText(now)}${capNote}\nStop any time with /autopilot 0 0 stop.` }
+    return { text: `${statusText(now)}\nEnd: ${endClock(until, startOffset)}, ${formatLeft(until - now)} left.${capNote}\nStop any time with /autopilot 0 0 stop.` }
   }).catch(() => ({ text: 'Autopilot: the command failed; nothing changed. Try again.' }))
 
   on('prompt.compose', async ($, e, next) => {
@@ -587,7 +769,7 @@ export const register: Register = on => {
     run.idleTurns = 0
     try {
       await save($)
-      const timeout = parsed.awaiting.timeoutAt ? `, checks at ${clockTime(parsed.awaiting.timeoutAt)} UTC` : ', no timeout'
+      const timeout = parsed.awaiting.timeoutAt ? `, checks at ${endClock(parsed.awaiting.timeoutAt, null)}` : ', no timeout'
       // A repeat in the same turn replaces the wait it declared.
       await log($, `${isRepeat ? 'wait updated: ' : 'waiting for '}${waitText(parsed.awaiting, now)}${timeout}`)
     } catch (error) {
@@ -616,12 +798,12 @@ export const register: Register = on => {
     if (!run || run.phase !== 'wrapping') {
       return { deny: 'Autopilot is not wrapping up: no restart. Continue your work.' }
     }
-    const givenPath = String((e as unknown as { handoffPath?: unknown }).handoffPath ?? '')
+    const givenPath = handoffArg(e)
     const root = await $.session.root()
     if (!isValidHandoffPath(root, givenPath)) {
       await log($, `restart refused: handoff path ${JSON.stringify(givenPath.slice(0, 300))} is not a .md file under thoughts/shared/handoffs/`)
       return {
-        deny: `Refused: the handoff must be a .md file under ${root}/thoughts/shared/handoffs/ (no "..", no control characters). Write it there with /create-handoff-doc, then call ${RESTART_TOOL} with its path.`,
+        deny: `Refused: the handoff must be a .md file under ${root}/thoughts/shared/handoffs/ (no "..", no control characters). Write it there with /create-handoff-doc, then call ${RESTART_TOOL} with its path. Pass it as "handoffPath".`,
       }
     }
     const handoffPath = resolveHandoffPath(root, givenPath)
@@ -629,7 +811,28 @@ export const register: Register = on => {
       return { deny: `No handoff document at "${handoffPath}". Write it with /create-handoff-doc first, then call ${RESTART_TOOL} with the path to the handoff .md under thoughts/shared/handoffs/ (absolute or relative to the project root).` }
     }
 
-    run.restarts += 1
+    // A grace resume must use the handoff written when the run finished, not an older one.
+    if (run.isGraceResume) {
+      const stat = await $.fs.stat(handoffPath).catch(() => null)
+      const check = graceHandoffCheck(stat?.mtimeMs ?? null, run.graceSince)
+      if (check === 'unknown') {
+        // Fail closed: without the final phase's start there is no telling which handoff is current.
+        run.isGraceResume = false
+        run.phase = 'paused'
+        await save($)
+        await log($, 'restart refused: a grace resume without the final handoff time; paused')
+
+        return { deny: 'Refused: autopilot cannot tell which handoff is current; the person will restart the session.' }
+      }
+      if (check === 'stale') {
+        await log($, `restart refused: handoff ${handoffPath} is older than the final handoff request`)
+
+        return { deny: `Refused: use the handoff you wrote when the run finished (newer than ${endClock(run.graceSince ?? 0, null)}), not an older one.` }
+      }
+    }
+    // A run the person brought back after it finished resumes without using up a restart.
+    if (run.isGraceResume) run.isGraceResume = false
+    else run.restarts += 1
     run.phase = 'restarting'
     run.handoffPath = handoffPath
     await save($)
@@ -699,7 +902,10 @@ export const register: Register = on => {
     if (!action) return ran
     const reason = now >= run.until ? 'time' : 'restarts'
     run.phase = action === 'wrapup' ? 'wrapping' : 'final'
-    if (action === 'final') run.finalReason = reason
+    if (action === 'final') {
+      run.finalReason = reason
+      run.finalAt = now
+    }
     await save($)
     await log($, `${action} requested mid-turn at ${percent ?? '?'}% context (trigger ${effectiveTrigger(run, ceiling)}%)`)
     if (action === 'final') await clearGoal($)
@@ -717,6 +923,24 @@ export const register: Register = on => {
     // An interrupted turn (the person, a command) decides nothing: reacting to it
     // with a prompt would interrupt the next one in turn.
     if (e.isAborted) return result
+
+    // A grace resume still waiting for its restart is asked again, then paused; ordinary wrap-ups are untouched.
+    const graceAction = graceTurnAction(run)
+    if (graceAction === 'ask') {
+      run.graceAsks = (run.graceAsks ?? 0) + 1
+      await save($)
+      await log($, 'grace resume: asked again')
+      queue($, graceResumePrompt(run.until, await utcOffset($)))
+      return result
+    }
+    if (graceAction === 'pause') {
+      run.phase = 'paused'
+      run.isGraceResume = false
+      await save($)
+      await log($, 'grace resume: no restart after the re-ask, paused')
+      $.ui.toast('Autopilot: the run was brought back but the session did not restart from its handoff. Paused; /autopilot to see it.')
+      return result
+    }
 
     const now = await $.clock.now()
     const usage = await $.session.usage().catch(() => null)
@@ -784,6 +1008,11 @@ export const register: Register = on => {
       const reason = run.finalReason
       await clearGoal($)
       await log($, `finished (${reason ?? 'done'}): handed back to the person`)
+      // A time-out or used-up restarts can be undone for a while: keep the run as it ended.
+      if (isGraceEligible(reason)) {
+        const record: FinishedRecord = { run: { ...run, phase: 'final' }, finishedAt: now }
+        await $.store.set(finishedKey(sessionId), record).catch(() => undefined)
+      }
       run = null
       await save($)
       $.ui.toast(
