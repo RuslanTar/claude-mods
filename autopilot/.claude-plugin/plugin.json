@@ -1,6 +1,6 @@
 {
   "name": "autopilot",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Run a session autonomously for a set time with a fixed role; hand off and restart itself at a context threshold",
   "types": "./types/index.d.ts"
 }
