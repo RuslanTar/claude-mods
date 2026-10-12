@@ -5,6 +5,7 @@ import {
   ASK_ANSWER,
   CONTINUE_PROMPT,
   FULL_WAIT_TOOL,
+  GRACE_MS,
   WAIT_REASONS,
   afterTurn,
   askAnswer,
@@ -15,10 +16,18 @@ import {
   endsWait,
   finalPrompt,
   followsNewSessionId,
+  formatLeft,
   goalState,
   goalVerdictsFromRows,
+  graceHandoffCheck,
+  graceResumePrompt,
+  graceStatusText,
+  graceTurnAction,
   identityFromRows,
   isDoneAnswer,
+  isGraceEligible,
+  isGraceLive,
+  isLiveFinishedValue,
   isValidHandoffPath,
   limitAction,
   namedSkills,
@@ -477,6 +486,91 @@ describe('retiming', () => {
     }
   })
 
+  test('a moved end must be at least a minute ahead; the time left shows seconds under a minute', async () => {
+    const to = (until: number) => ({ until, maxRestarts: null })
+    expect(retime(run({}), to(NOW + 59_999), NOW)).toEqual({
+      kind: 'refuse',
+      message: 'The new end must be at least 1 minute ahead. To hand back now: /autopilot 0 0 stop.',
+    })
+    expect(retime(run({}), to(NOW + 60_000), NOW).kind).toBe('set')
+    expect(retime(run({}), to(NOW - 1), NOW)).toEqual({
+      kind: 'refuse',
+      message: 'The new end would be in the past. To hand back now: /autopilot 0 0 stop.',
+    })
+    expect(formatLeft(45_000)).toBe('45s')
+    expect(formatLeft(3_000)).toBe('3s')
+    expect(formatLeft(-5_000)).toBe('0s')
+    expect(formatLeft(60_000)).toBe('1m')
+    expect(formatLeft(5_400_000)).toBe('1h30m')
+  })
+
+  test('a flag-style retime word gets a hint', async () => {
+    expect(parseCommand('--shorten 1m')).toEqual({ kind: 'error', message: 'Did you mean /autopilot shorten 1m?' })
+    expect(parseCommand('--EXTEND')).toEqual({ kind: 'error', message: 'Did you mean /autopilot extend?' })
+    expect(parseCommand('--until 6pm')).toEqual({ kind: 'error', message: 'Did you mean /autopilot until 6pm?' })
+  })
+
+  test('a finished run can be brought back for a grace period, on time or restarts only', async () => {
+    expect(isGraceEligible('time')).toBe(true)
+    expect(isGraceEligible('restarts')).toBe(true)
+    for (const reason of ['goal', 'week', 'done', null] as const) expect(isGraceEligible(reason)).toBe(false)
+
+    const record = { run: run({ phase: 'final', finalReason: 'time', until: NOW }), finishedAt: NOW }
+    expect(isGraceLive(record, NOW + GRACE_MS)).toBe(true)
+    expect(isGraceLive(record, NOW + GRACE_MS + 1)).toBe(false)
+    expect(graceStatusText(record, NOW + 5 * 60_000)).toBe(
+      'Autopilot finished (time) at 00:16 UTC; /autopilot extend <time> within 10m brings it back from its handoff.',
+    )
+    const byRestarts = { ...record, run: { ...record.run, finalReason: 'restarts' as const } }
+    expect(graceStatusText(byRestarts, NOW + 5 * 60_000)).toBe(
+      'Autopilot finished (restarts) at 00:16 UTC; /autopilot extend --restarts N within 10m brings it back from its handoff.',
+    )
+    expect(graceResumePrompt(Date.UTC(2026, 9, 12, 15, 30), 180)).toBe(
+      'Autopilot: the person brought this run back until 18:30 (15:30 UTC). Call restart_session with the path of the handoff you just wrote under thoughts/shared/handoffs/; autopilot will clear the session and resume from it. Do not start other work first.',
+    )
+
+    // against the recorded run, an extend counts from now and revives; a different reason refuses
+    const later = NOW + 20 * 60_000
+    const target = targetChange({ kind: 'extend', deltaMs: HOUR, restarts: 0 }, record.run, later, 0)
+    expect(target).toEqual({ until: later + HOUR, maxRestarts: null, note: null })
+    expect(retime(record.run, target as { until: number; maxRestarts: null }, later)).toEqual({
+      kind: 'revive',
+      phase: 'running',
+      waitUntil: null,
+      until: later + HOUR,
+      maxRestarts: null,
+    })
+    expect(retime(run({ phase: 'final', finalReason: 'week' }), { until: later + HOUR, maxRestarts: null }, later).kind).toBe('refuse')
+  })
+
+  test('a finished value is live only inside the grace period and when well formed', async () => {
+    const record = { run: run({ phase: 'final', finalReason: 'time' }), finishedAt: NOW }
+    expect(isLiveFinishedValue(record, NOW + GRACE_MS)).toBe(true)
+    expect(isLiveFinishedValue(record, NOW + GRACE_MS + 1)).toBe(false)
+    for (const bad of [null, undefined, 'text', 7, {}, { finishedAt: 'soon' }, { finishedAt: Number.NaN }, { finishedAt: Infinity }]) {
+      expect(isLiveFinishedValue(bad, NOW)).toBe(false)
+    }
+  })
+
+  test('a grace resume is asked once more, then paused; other runs are left alone', async () => {
+    const resuming = (graceAsks: number | undefined) => run({ phase: 'wrapping', isGraceResume: true, graceAsks })
+    expect(graceTurnAction(resuming(undefined))).toBe('ask')
+    expect(graceTurnAction(resuming(0))).toBe('ask')
+    expect(graceTurnAction(resuming(1))).toBe('pause')
+    expect(graceTurnAction(resuming(2))).toBe('pause')
+    expect(graceTurnAction(run({ phase: 'wrapping' }))).toBe('none')
+    expect(graceTurnAction(run({ phase: 'restarting', isGraceResume: true }))).toBe('none')
+    expect(graceTurnAction(run({ phase: 'running', isGraceResume: true }))).toBe('none')
+  })
+
+  test('a grace resume needs a handoff written after the final phase began', async () => {
+    expect(graceHandoffCheck(NOW, NOW)).toBe('ok')
+    expect(graceHandoffCheck(NOW + 1, NOW)).toBe('ok')
+    expect(graceHandoffCheck(NOW - 1, NOW)).toBe('stale')
+    expect(graceHandoffCheck(null, NOW)).toBe('stale')
+    expect(graceHandoffCheck(NOW, undefined)).toBe('unknown')
+  })
+
   test('the end clock shows local and UTC time', async () => {
     const until = Date.UTC(2026, 9, 12, 15, 30)
     expect(endClock(until, 180)).toBe('18:30 (15:30 UTC)')
@@ -768,7 +862,7 @@ describe('wait_for', () => {
     const awaiting: Awaiting = { reason: 'session-answer', from: 'BE-expert', note: null, since: 0, timeoutAt: null, pinged: false }
     expect(waitText(awaiting, 12 * 60_000)).toBe('session-answer ← "BE-expert" · 12m')
     expect(waitText({ ...awaiting, note: 'API "shape"' }, 12 * 60_000)).toBe('session-answer ← "BE-expert" · 12m — "API \\"shape\\""')
-    expect(waitText({ ...awaiting, from: null }, 0)).toBe('session-answer · 0m')
+    expect(waitText({ ...awaiting, from: null }, 0)).toBe('session-answer · 0s')
     const prompt = waitTimeoutPrompt({ ...awaiting, note: 'API shape' }, 45 * 60_000)
     expect(prompt).toContain('45m for session-answer from "BE-expert" ("API shape")')
     expect(prompt).toContain('PushNotification')

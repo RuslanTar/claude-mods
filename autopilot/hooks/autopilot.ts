@@ -1,4 +1,4 @@
-import type { Awaiting, Command, FinalReason, Phase, Run, StartCommand, TokenWindow, WaitReason } from '../types'
+import type { Awaiting, Command, FinalReason, FinishedRecord, Phase, Run, StartCommand, TokenWindow, WaitReason } from '../types'
 
 export const RESTART_TOOL = 'restart_session'
 export const WAIT_TOOL = 'wait_for'
@@ -72,6 +72,69 @@ function durationMs(text: string): number | null {
   if (!match || (!match[1] && !match[2])) return null
 
   return (Number(match[1] ?? 0) * 60 + Number(match[2] ?? 0)) * 60_000
+}
+
+/** A moved end must stay at least this far ahead of now. */
+const MIN_LEAD_MS = 60_000
+
+/** How long after finishing on time or restarts the person can still bring a run back. */
+export const GRACE_MS = 15 * 60_000
+
+/** Whether a run that finished for this reason can be brought back (a time-out or used-up restarts only). */
+export function isGraceEligible(reason: FinalReason | null): boolean {
+  return reason === 'time' || reason === 'restarts'
+}
+
+export function isGraceLive(record: FinishedRecord, now: number): boolean {
+  return now - record.finishedAt <= GRACE_MS
+}
+
+/** Whether a stored `finished:` value is a record still inside its grace period; anything malformed is not. */
+export function isLiveFinishedValue(value: unknown, now: number): boolean {
+  if (typeof value !== 'object' || value === null) return false
+  const finishedAt = (value as { finishedAt?: unknown }).finishedAt
+  if (typeof finishedAt !== 'number' || !Number.isFinite(finishedAt)) return false
+
+  return isGraceLive(value as FinishedRecord, now)
+}
+
+/** What `/autopilot` says when there is no run but a finished one can still be brought back. */
+export function graceStatusText(record: FinishedRecord, now: number): string {
+  const minutesLeft = Math.max(0, Math.ceil((GRACE_MS - (now - record.finishedAt)) / 60_000))
+
+  const ask = record.run.finalReason === 'restarts' ? 'extend --restarts N' : 'extend <time>'
+
+  return `Autopilot finished (${record.run.finalReason}) at ${endClock(record.finishedAt, null)}; /autopilot ${ask} within ${minutesLeft}m brings it back from its handoff.`
+}
+
+/** How many times a grace resume asks the session to restart before it gives up. */
+const MAX_GRACE_ASKS = 1
+
+/**
+ * What a finished main-loop turn means for a grace resume that is still
+ * waiting for its restart: ask once more, or pause. Any
+ * other run (an ordinary wrap-up included) is none of its business.
+ */
+export function graceTurnAction(run: Run): 'none' | 'ask' | 'pause' {
+  if (run.phase !== 'wrapping' || !run.isGraceResume) return 'none'
+
+  return (run.graceAsks ?? 0) < MAX_GRACE_ASKS ? 'ask' : 'pause'
+}
+
+/**
+ * Whether a grace resume's handoff is the current one: written at or after the
+ * final phase began (`ok`), older or unreadable (`stale`), or no start time to
+ * compare with (`unknown`, which fails closed).
+ */
+export function graceHandoffCheck(mtimeMs: number | null, since: number | undefined): 'ok' | 'stale' | 'unknown' {
+  if (since === undefined) return 'unknown'
+
+  return mtimeMs !== null && mtimeMs >= since ? 'ok' : 'stale'
+}
+
+/** The prompt that makes a finished run restart from the handoff it already wrote. */
+export function graceResumePrompt(until: number, offsetMinutes: number | null): string {
+  return `Autopilot: the person brought this run back until ${endClock(until, offsetMinutes)}. Call ${RESTART_TOOL} with the path of the handoff you just wrote under thoughts/shared/handoffs/; autopilot will clear the session and resume from it. Do not start other work first.`
 }
 
 /** The most restarts a limit may reach. */
@@ -194,6 +257,9 @@ export function retime(run: Run | null, target: RetimeTarget, now: number, limit
   if (endsForGood(run)) return { kind: 'refuse', message: finishingText(run.finalReason) }
   if (target.until <= now) {
     return { kind: 'refuse', message: 'The new end would be in the past. To hand back now: /autopilot 0 0 stop.' }
+  }
+  if (target.until - now < MIN_LEAD_MS) {
+    return { kind: 'refuse', message: 'The new end must be at least 1 minute ahead. To hand back now: /autopilot 0 0 stop.' }
   }
   const { until, maxRestarts } = target
   if (!isFinal) return { kind: 'set', until, maxRestarts }
@@ -377,6 +443,12 @@ export function parseCommand(args: string): Command {
   if (!text) return { kind: 'status' }
   if (/^(0\s+0\s+)?stop$/i.test(text)) return { kind: 'stop' }
 
+  const dashed = /^--(extend|shorten|until)\b\s*(.*)$/i.exec(text)
+  if (dashed) {
+    const rest = echoed((dashed[2] ?? '').trim())
+
+    return { kind: 'error', message: `Did you mean /autopilot ${dashed[1]?.toLowerCase()}${rest ? ` ${rest}` : ''}?` }
+  }
   const retimeMatch = /^(extend|shorten)(?:\s+([\s\S]*))?$/i.exec(text)
   if (retimeMatch) {
     const kind = retimeMatch[1]?.toLowerCase() === 'extend' ? 'extend' : 'shorten'
@@ -807,6 +879,7 @@ export function resolveHandoffPath(root: string, path: string): string {
 }
 
 export function formatLeft(ms: number): string {
+  if (ms < 60_000) return `${Math.max(0, Math.round(ms / 1000))}s`
   const minutes = Math.max(0, Math.round(ms / 60_000))
   if (minutes < 60) return `${minutes}m`
 

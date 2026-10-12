@@ -70,7 +70,18 @@ export type Run = {
   awaiting: Awaiting | null
   /** Whether questions go to the person (--ask-user) instead of being answered by autopilot. Missing in older runs. */
   askUser: boolean
+  /** Set when the person brought a finished run back: the next restart does not count against the restarts. */
+  isGraceResume?: boolean
+  /** When the run entered its final phase: the handoff of a grace resume must be newer than this. */
+  finalAt?: number
+  /** For a grace resume: the final phase's start, copied from the finished run's `finalAt`. */
+  graceSince?: number
+  /** For a grace resume: how many times the session was asked again to restart. */
+  graceAsks?: number
 }
+
+/** A run that finished on time or restarts, kept for a grace period so the person can bring it back. */
+export type FinishedRecord = { run: Run; finishedAt: number }
 
 export type StartCommand = {
   kind: 'start'
