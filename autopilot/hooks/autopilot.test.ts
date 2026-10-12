@@ -11,6 +11,7 @@ import {
   autoAnswersQuestions,
   canRestart,
   effectiveTrigger,
+  endClock,
   endsWait,
   finalPrompt,
   followsNewSessionId,
@@ -21,12 +22,18 @@ import {
   isValidHandoffPath,
   limitAction,
   namedSkills,
+  parseClock,
   parseCommand,
   parseDuration,
+  parseUtcOffset,
   parseWaitInput,
+  retime,
+  revivePrompt,
   roleSection,
   shouldDropStopBlock,
+  targetChange,
   triggerCeiling,
+  untilFromClock,
   waitPhaseRefusal,
   waitRefusal,
   waitText,
@@ -95,16 +102,16 @@ describe('command', () => {
     expect(parseCommand('0 0 stop')).toEqual({ kind: 'stop' })
     expect(parseCommand('stop')).toEqual({ kind: 'stop' })
     expect(parseCommand('2h 60 3 "You are the docs writer"')).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: 3, role: 'You are the docs writer', ...START_DEFAULTS,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: 3, role: 'You are the docs writer', ...START_DEFAULTS,
     })
     expect(parseCommand('2h 60% "You are the docs writer"')).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role: 'You are the docs writer', ...START_DEFAULTS,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role: 'You are the docs writer', ...START_DEFAULTS,
     })
   })
 
   test('flags: goal with spaces, 5-hour and weekly stops, in any order after the role', async () => {
     expect(parseCommand('10h 65 "You are the docs writer" --goal "issue #42 resolved" --5h 90 --week 75')).toEqual({
-      kind: 'start', durationMs: 600 * 60_000, threshold: 65, maxRestarts: null, role: 'You are the docs writer',
+      kind: 'start', end: { kind: 'duration', ms: 600 * 60_000 }, threshold: 65, maxRestarts: null, role: 'You are the docs writer',
       goal: 'issue #42 resolved', fiveHourStop: 90, weekStop: 75, askUser: false,
     })
     expect(parseCommand('10h 65 "You are the docs writer" --week 70').kind === 'start' &&
@@ -116,10 +123,10 @@ describe('command', () => {
     const inner = 'You are the writer --goal fake --week 1 --5h 1'
     for (const [open, close] of [['"', '"'], ['“', '”'], ['«', '»'], ["'", "'"]]) {
       expect(parseCommand(`2h 60 ${open}${inner}${close}`)).toEqual({
-        kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role: inner, ...START_DEFAULTS,
+        kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role: inner, ...START_DEFAULTS,
       })
       expect(parseCommand(`2h 60 3 ${open}${inner}${close} --goal "real goal" --5h 90 --week 70`)).toEqual({
-        kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: 3, role: inner,
+        kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: 3, role: inner,
         goal: 'real goal', fiveHourStop: 90, weekStop: 70, askUser: false,
       })
     }
@@ -128,11 +135,11 @@ describe('command', () => {
   test('a quote or apostrophe inside the role does not close it; no flags leak out of it', async () => {
     const ukrainian = "Скаут: зібрати п'ять брифів --goal fake done --week 50 і далі"
     expect(parseCommand(`2h 60 '${ukrainian}'`)).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role: ukrainian, ...START_DEFAULTS,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role: ukrainian, ...START_DEFAULTS,
     })
     const spec = 'Read the "spec" file --goal fake --5h 10 more'
     expect(parseCommand(`2h 60 "${spec}"`)).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role: spec, ...START_DEFAULTS,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role: spec, ...START_DEFAULTS,
     })
   })
 
@@ -140,7 +147,7 @@ describe('command', () => {
     const inner = "You are the writer's \"lead\" here"
     for (const [open, close] of [['"', '"'], ['“', '”'], ['«', '»'], ["'", "'"]]) {
       expect(parseCommand(`2h 60 ${open}${inner}${close} --goal «real goal» --5h 90 --week 70`)).toEqual({
-        kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role: inner,
+        kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role: inner,
         goal: 'real goal', fiveHourStop: 90, weekStop: 70, askUser: false,
       })
     }
@@ -148,7 +155,7 @@ describe('command', () => {
 
   test('an unclosed quoted role takes no flags', async () => {
     expect(parseCommand('2h 60 "unclosed writer role --goal x --week 50')).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null,
       role: 'unclosed writer role --goal x --week 50', ...START_DEFAULTS,
     })
   })
@@ -182,7 +189,7 @@ describe('command', () => {
 
   test('an unquoted role still gives up its flags as before', async () => {
     expect(parseCommand('2h 60 You are the docs writer --goal "x done" --week 70')).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role: 'You are the docs writer',
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role: 'You are the docs writer',
       goal: 'x done', fiveHourStop: 95, weekStop: 70, askUser: false,
     })
   })
@@ -192,7 +199,7 @@ describe('command', () => {
     const start = (args: string) => parseCommand(args) as { kind: string; askUser?: boolean; role?: string; goal?: string | null; weekStop?: number }
     expect(start(`2h 60 "${role}"`).askUser).toBe(false)
     expect(start(`2h 60 "${role}" --ask-user`)).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role, ...START_DEFAULTS, askUser: true,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role, ...START_DEFAULTS, askUser: true,
     })
     const mixed = start(`2h 60 3 «${role}» --week 70 --ask-user --goal "x done"`)
     expect(mixed.askUser).toBe(true)
@@ -201,18 +208,18 @@ describe('command', () => {
     expect(mixed.weekStop).toBe(70)
     expect(start(`2h 60 "${role}" --ask-user --ask-user`).askUser).toBe(true)
     expect(start(`2h 60 ${role} --ask-user`)).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role, ...START_DEFAULTS, askUser: true,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role, ...START_DEFAULTS, askUser: true,
     })
   })
 
   test('--ask-user inside a quoted role or a quoted goal stays there', async () => {
     const inner = 'You are the writer --ask-user here'
     expect(parseCommand(`2h 60 "${inner}"`)).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role: inner, ...START_DEFAULTS,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role: inner, ...START_DEFAULTS,
     })
     const tail = 'You are the writer --ask-user'
     expect(parseCommand(`2h 60 '${tail}'`)).toEqual({
-      kind: 'start', durationMs: 120 * 60_000, threshold: 60, maxRestarts: null, role: tail, ...START_DEFAULTS,
+      kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role: tail, ...START_DEFAULTS,
     })
     const goal = parseCommand('2h 60 "You are the docs writer" --goal "ask --ask-user later"') as { goal: string; askUser: boolean }
     expect(goal.goal).toBe('ask --ask-user later')
@@ -234,6 +241,324 @@ describe('command', () => {
     expect(parseCommand('soon 60 "You are the docs writer"').kind).toBe('error')
     expect(parseCommand('2h 99 "You are the docs writer"').kind).toBe('error')
     expect(parseCommand('2h 60 3').kind).toBe('error')
+  })
+
+  test('reads extend, shorten and until', async () => {
+    expect(parseCommand('extend 2h')).toEqual({ kind: 'extend', deltaMs: 7_200_000, restarts: 0 })
+    expect(parseCommand('EXTEND 1h')).toEqual({ kind: 'extend', deltaMs: 3_600_000, restarts: 0 })
+    expect(parseCommand('  extend   2h  ')).toEqual({ kind: 'extend', deltaMs: 7_200_000, restarts: 0 })
+    expect(parseCommand('shorten 30m')).toEqual({ kind: 'shorten', deltaMs: 1_800_000, restarts: 0 })
+    expect(parseCommand('until 9:05')).toEqual({ kind: 'until', hours: 9, minutes: 5 })
+    expect(parseCommand('until 18:30')).toEqual({ kind: 'until', hours: 18, minutes: 30 })
+    expect(parseCommand('until 23:59')).toEqual({ kind: 'until', hours: 23, minutes: 59 })
+    expect(parseCommand('  until   18:30 ')).toEqual({ kind: 'until', hours: 18, minutes: 30 })
+    expect(parseCommand('stop')).toEqual({ kind: 'stop' })
+  })
+
+  test('reads --restarts on extend and shorten', async () => {
+    expect(parseCommand('extend 2h --restarts 3')).toEqual({ kind: 'extend', deltaMs: 7_200_000, restarts: 3 })
+    expect(parseCommand('extend --restarts 3')).toEqual({ kind: 'extend', deltaMs: 0, restarts: 3 })
+    expect(parseCommand('shorten --restarts 1')).toEqual({ kind: 'shorten', deltaMs: 0, restarts: 1 })
+    expect(parseCommand('shorten  --restarts  99  30m')).toEqual({ kind: 'shorten', deltaMs: 1_800_000, restarts: 99 })
+  })
+
+  test('refuses a malformed extend, shorten or until', async () => {
+    expect(parseCommand('extend')).toEqual({ kind: 'error', message: 'Usage: /autopilot extend [<time>] [--restarts N]' })
+    expect(parseCommand('extend abc')).toEqual({ kind: 'error', message: 'Cannot read the time "abc" (try 90m, 2h, 1h30m).' })
+    expect(parseCommand('extend 0m').kind).toBe('error')
+    expect(parseCommand('shorten')).toEqual({ kind: 'error', message: 'Usage: /autopilot shorten [<time>] [--restarts N]' })
+    expect(parseCommand('extend 2h --restarts 0')).toEqual({ kind: 'error', message: '--restarts needs a whole number from 1 to 99.' })
+    expect(parseCommand('extend --restarts abc').kind).toBe('error')
+    expect(parseCommand('extend --restarts 100').kind).toBe('error')
+    expect(parseCommand('extend 2h --restarts').kind).toBe('error')
+    const clockError = { kind: 'error', message: 'Give the end as HH:MM (24-hour) or with am/pm, e.g. until 18:30 or until 6:30pm (local time).' }
+    expect(parseCommand('until 25:00')).toEqual(clockError)
+    expect(parseCommand('until 24:00')).toEqual(clockError)
+    expect(parseCommand('until 7:5')).toEqual(clockError)
+    expect(parseCommand('until 1830')).toEqual(clockError)
+    expect(parseCommand('until')).toEqual({ kind: 'error', message: 'Usage: /autopilot until HH:MM' })
+    const noRestarts = { kind: 'error', message: 'until takes no --restarts; use /autopilot extend --restarts N.' }
+    expect(parseCommand('until 18:30 --restarts 2')).toEqual(noRestarts)
+    expect(parseCommand('until 6pm 60 "You are the docs writer" --restarts 2')).toEqual(noRestarts)
+    const usage = parseCommand('until 6pm --goal "x"')
+    expect(usage.kind === 'error' && usage.message.startsWith('Usage: /autopilot <time')).toBe(true)
+  })
+
+  test('flags may come before the time, for a duration and for a clock', async () => {
+    const role = 'You are the docs writer'
+    const duration = { kind: 'start', end: { kind: 'duration', ms: 120 * 60_000 }, threshold: 60, maxRestarts: null, role, ...START_DEFAULTS }
+    expect(parseCommand(`--goal "x" 2h 60 "${role}"`)).toEqual({ ...duration, goal: 'x' })
+    expect(parseCommand(`--ask-user 2h 60 "${role}"`)).toEqual({ ...duration, askUser: true })
+    expect(parseCommand(`--5h 90 --week 70 2h 60 "${role}"`)).toEqual({ ...duration, fiveHourStop: 90, weekStop: 70 })
+    expect(parseCommand(`2h --goal "x" 60 "${role}"`)).toEqual({ ...duration, goal: 'x' })
+    const clock = { ...duration, end: { kind: 'clock', hours: 18, minutes: 0 } }
+    expect(parseCommand(`until 6pm --goal "x" 60 "${role}"`)).toEqual({ ...clock, goal: 'x' })
+    expect(parseCommand(`until 6pm 60 "${role}" --ask-user`)).toEqual({ ...clock, askUser: true })
+    expect(parseCommand(`soon --goal "x" 60 "${role}"`)).toEqual({
+      kind: 'error',
+      message: 'Cannot read the time "soon" (try 90m, 2h, 1h30m).',
+    })
+  })
+
+  test('parseClock reads 24-hour and 12-hour clocks', async () => {
+    expect(parseClock('18:30')).toEqual({ hours: 18, minutes: 30 })
+    expect(parseClock('7:30')).toEqual({ hours: 7, minutes: 30 })
+    expect(parseClock('6pm')).toEqual({ hours: 18, minutes: 0 })
+    expect(parseClock('6:30pm')).toEqual({ hours: 18, minutes: 30 })
+    expect(parseClock('12am')).toEqual({ hours: 0, minutes: 0 })
+    expect(parseClock('12pm')).toEqual({ hours: 12, minutes: 0 })
+    expect(parseClock('11:59PM')).toEqual({ hours: 23, minutes: 59 })
+    expect(parseClock('6Am')).toEqual({ hours: 6, minutes: 0 })
+    for (const bad of ['13pm', '0am', '6:60pm', '6 pm', '6', '1830', '24:00', '7:5', '']) expect(parseClock(bad)).toBeNull()
+  })
+
+  test('starts with an end time', async () => {
+    const role = 'You are the docs writer'
+    expect(parseCommand(`until 18:30 65 "${role}"`)).toEqual({
+      kind: 'start',
+      end: { kind: 'clock', hours: 18, minutes: 30 },
+      threshold: 65,
+      maxRestarts: null,
+      role,
+      ...START_DEFAULTS,
+    })
+    expect(parseCommand(`until 6pm 60 3 "${role}" --goal "x"`)).toEqual({
+      kind: 'start',
+      end: { kind: 'clock', hours: 18, minutes: 0 },
+      threshold: 60,
+      maxRestarts: 3,
+      role,
+      ...START_DEFAULTS,
+      goal: 'x',
+    })
+    expect(parseCommand('until 6pm')).toEqual({ kind: 'until', hours: 18, minutes: 0 })
+    expect(parseCommand(`until 6 pm 65 "${role}"`).kind).toBe('error')
+    expect(parseCommand(`until 25:00 65 "${role}"`).kind).toBe('error')
+  })
+
+  test('error replies echo the raw time capped and without invisible characters', async () => {
+    const long = parseCommand(`extend ${'x'.repeat(100)}`)
+    expect(long).toEqual({ kind: 'error', message: `Cannot read the time "${'x'.repeat(40)}…" (try 90m, 2h, 1h30m).` })
+    expect(parseCommand('extend a‮b\u0007c')).toEqual({ kind: 'error', message: 'Cannot read the time "abc" (try 90m, 2h, 1h30m).' })
+    expect(parseCommand(`${'y'.repeat(60)} 60 "You are the docs writer"`)).toEqual({
+      kind: 'error',
+      message: `Cannot read the time "${'y'.repeat(40)}…" (try 90m, 2h, 1h30m).`,
+    })
+  })
+
+  test('a huge digit string is not a duration', async () => {
+    expect(parseDuration('9'.repeat(400))).toBeNull()
+  })
+})
+
+describe('retiming', () => {
+  const NOW = 1_000_000
+  const HOUR = 3_600_000
+
+  test('parses a UTC offset', async () => {
+    expect(parseUtcOffset('+0300')).toBe(180)
+    expect(parseUtcOffset('-0530\n')).toBe(-330)
+    expect(parseUtcOffset('+0000')).toBe(0)
+    expect(parseUtcOffset('soon')).toBeNull()
+  })
+
+  test('finds the next local clock time', async () => {
+    const midnight = Date.UTC(2026, 9, 12)
+    // 10:00 UTC, offset +3 → local 13:00
+    const now = midnight + 10 * HOUR
+    expect(untilFromClock(15, 0, now, 180)).toBe(midnight + 12 * HOUR)
+    expect(untilFromClock(9, 0, now, 180)).toBe(midnight + 24 * HOUR + 6 * HOUR)
+    expect(untilFromClock(13, 0, now, 180)).toBe(midnight + 24 * HOUR + 10 * HOUR)
+    // offset -5 → local 05:00; 18:30 local is 23:30 UTC
+    expect(untilFromClock(18, 30, now, -300)).toBe(midnight + 23 * HOUR + 30 * 60_000)
+    // 22:00 UTC, offset +3 → local 01:00 next day; 02:00 local is 23:00 UTC today
+    expect(untilFromClock(2, 0, midnight + 22 * HOUR, 180)).toBe(midnight + 23 * HOUR)
+  })
+
+  test('targetChange works out the end and the restart limit', async () => {
+    const ask = (kind: 'extend' | 'shorten', deltaMs: number, restarts: number) => ({ kind, deltaMs, restarts }) as const
+    const limited = run({ until: 5 * HOUR, restarts: 2, maxRestarts: 4 })
+    expect(targetChange(ask('extend', HOUR, 0), limited, NOW, 0)).toEqual({ until: 6 * HOUR, maxRestarts: 4, note: null })
+    expect(targetChange(ask('shorten', HOUR, 0), limited, NOW, 0)).toEqual({ until: 4 * HOUR, maxRestarts: 4, note: null })
+    // an end in the past counts from now
+    const over = run({ phase: 'final', finalReason: 'time', until: NOW - HOUR })
+    expect(targetChange(ask('extend', 2 * HOUR, 0), over, NOW, 0)).toEqual({ until: NOW + 2 * HOUR, maxRestarts: null, note: null })
+    expect(targetChange(ask('extend', 0, 3), limited, NOW, 0)).toEqual({ until: 5 * HOUR, maxRestarts: 7, note: null })
+    // unlimited: extend counts from the restarts used, shorten is ignored with a note
+    const unlimited = run({ until: 5 * HOUR, restarts: 2, maxRestarts: null })
+    expect(targetChange(ask('extend', 0, 3), unlimited, NOW, 0)).toEqual({ until: 5 * HOUR, maxRestarts: 5, note: null })
+    expect(targetChange(ask('shorten', 0, 1), unlimited, NOW, 0)).toEqual({
+      until: 5 * HOUR,
+      maxRestarts: null,
+      note: 'Restarts are unlimited in this run; --restarts on shorten was ignored.',
+    })
+    expect(targetChange(ask('shorten', 0, 1), limited, NOW, 0)).toEqual({ until: 5 * HOUR, maxRestarts: 3, note: null })
+    expect(targetChange(ask('shorten', 0, 9), limited, NOW, 0)).toEqual({
+      until: 5 * HOUR,
+      maxRestarts: 2,
+      note: 'No restarts left after this change (2 used).',
+    })
+    const clock = { kind: 'until', hours: 15, minutes: 0 } as const
+    expect(targetChange(clock, limited, Date.UTC(2026, 9, 12, 10), 180)).toEqual({
+      until: Date.UTC(2026, 9, 12, 12),
+      maxRestarts: 4,
+      note: null,
+    })
+    expect(targetChange(clock, limited, NOW, null)).toEqual({
+      refuse: 'Cannot read the local time zone; use /autopilot extend or shorten instead.',
+    })
+  })
+
+  test('retime revives a run that ended on restarts or time', async () => {
+    const exhausted = run({ phase: 'final', finalReason: 'restarts', until: NOW + HOUR, restarts: 3, maxRestarts: 3 })
+    expect(retime(exhausted, { until: NOW + HOUR, maxRestarts: 5 }, NOW)).toEqual({
+      kind: 'revive',
+      phase: 'running',
+      waitUntil: null,
+      until: NOW + HOUR,
+      maxRestarts: 5,
+    })
+    expect(retime(exhausted, { until: NOW + 2 * HOUR, maxRestarts: 3 }, NOW)).toEqual({
+      kind: 'refuse',
+      message: 'Autopilot is finishing because it used all its restarts; more time does not change that. Start a new run after it hands back.',
+    })
+    // restarts-only is decided from the command: targetChange, then retime
+    const over = "The run's time is over; add time too, e.g. /autopilot extend 1h --restarts N."
+    const restartsOnly = { kind: 'extend', deltaMs: 0, restarts: 2 } as const
+    const timedOut = run({ phase: 'final', finalReason: 'time', until: NOW - HOUR })
+    expect(targetChange(restartsOnly, timedOut, NOW, 0)).toEqual({ refuse: over })
+    const justPassed = run({ phase: 'running', until: NOW - 1 })
+    expect(targetChange(restartsOnly, justPassed, NOW, 0)).toEqual({ refuse: over })
+    expect(targetChange({ kind: 'shorten', deltaMs: 0, restarts: 1 }, justPassed, NOW, 0)).toEqual({
+      refuse: "The run's time is over; restarts cannot be changed on a finished time, add time with /autopilot extend.",
+    })
+    const timeLeft = run({ phase: 'final', finalReason: 'restarts', until: NOW + HOUR, restarts: 3, maxRestarts: 3 })
+    const target = targetChange(restartsOnly, timeLeft, NOW, 0)
+    expect(target).toEqual({ until: NOW + HOUR, maxRestarts: 5, note: null })
+    expect(retime(timeLeft, target as { until: number; maxRestarts: number }, NOW)).toEqual({
+      kind: 'revive',
+      phase: 'running',
+      waitUntil: null,
+      until: NOW + HOUR,
+      maxRestarts: 5,
+    })
+    const waiting = run({ phase: 'final', finalReason: 'time', waitUntil: NOW + HOUR })
+    expect(retime(waiting, { until: NOW + 2 * HOUR, maxRestarts: null }, NOW)).toEqual({
+      kind: 'revive',
+      phase: 'waiting',
+      waitUntil: NOW + HOUR,
+      until: NOW + 2 * HOUR,
+      maxRestarts: null,
+    })
+    // the token windows: the weekly stop refuses a revive, the 5-hour stop parks it until the reset
+    const timedOutRun = run({ phase: 'final', finalReason: 'time', weekStop: 80 })
+    const later = { until: NOW + HOUR, maxRestarts: null }
+    expect(retime(timedOutRun, later, NOW, { kind: 'week' })).toEqual({
+      kind: 'refuse',
+      message: 'The weekly token limit is at its stop (80%); the run cannot continue.',
+    })
+    expect(retime(timedOutRun, later, NOW, { kind: 'five-hour', waitUntil: NOW + 3 * HOUR })).toEqual({
+      kind: 'revive',
+      phase: 'waiting',
+      waitUntil: NOW + 3 * HOUR,
+      until: NOW + HOUR,
+      maxRestarts: null,
+    })
+    // a plain set ignores the windows
+    expect(retime(run({ phase: 'running' }), later, NOW, { kind: 'week' }).kind).toBe('set')
+    const stale = run({ phase: 'final', finalReason: 'time', waitUntil: NOW - 1 })
+    expect(retime(stale, { until: NOW + HOUR, maxRestarts: null }, NOW).kind).toBe('revive')
+    for (const phase of ['waiting', 'awaiting', 'wrapping', 'restarting', 'resuming'] as const) {
+      expect(retime(run({ phase }), { until: NOW + HOUR, maxRestarts: null }, NOW)).toEqual({
+        kind: 'set',
+        until: NOW + HOUR,
+        maxRestarts: null,
+      })
+    }
+  })
+
+  test('the end clock shows local and UTC time', async () => {
+    const until = Date.UTC(2026, 9, 12, 15, 30)
+    expect(endClock(until, 180)).toBe('18:30 (15:30 UTC)')
+    expect(endClock(until, -330)).toBe('10:00 (15:30 UTC)')
+    expect(endClock(until, null)).toBe('15:30 UTC')
+  })
+
+  test('retime sets, revives or refuses', async () => {
+    const to = (until: number) => ({ until, maxRestarts: null })
+    expect(retime(null, to(NOW + HOUR), NOW)).toEqual({
+      kind: 'refuse',
+      message: 'Autopilot is not running. Start a new run: /autopilot <time> <threshold%> "<role>".',
+    })
+    const finishing = (reason: string) =>
+      `Autopilot is finishing because ${reason}; more time does not change that. Start a new run after it hands back.`
+    expect(retime(run({ phase: 'final', finalReason: 'week' }), to(NOW + HOUR), NOW)).toEqual({
+      kind: 'refuse',
+      message: finishing('the weekly token limit was reached'),
+    })
+    expect(retime(run({ phase: 'final', finalReason: 'restarts', restarts: 1, maxRestarts: 1 }), to(NOW + HOUR), NOW)).toEqual({
+      kind: 'revive',
+      phase: 'running',
+      waitUntil: null,
+      until: NOW + HOUR,
+      maxRestarts: null,
+    })
+    expect(retime(run({ phase: 'final', finalReason: 'done' }), to(NOW + HOUR), NOW)).toEqual({
+      kind: 'refuse',
+      message: finishing('the session reported its work complete'),
+    })
+    expect(retime(run({ phase: 'final', finalReason: null }), to(NOW + HOUR), NOW)).toEqual({
+      kind: 'refuse',
+      message: finishing('it is wrapping up'),
+    })
+    expect(retime(run({}), to(NOW + 8 * 24 * HOUR), NOW)).toEqual({ kind: 'refuse', message: 'The end can be at most 7 days from now.' })
+    expect(retime(run({}), to(Infinity), NOW).kind).toBe('refuse')
+    expect(retime(run({}), to(NOW - 1), NOW)).toEqual({
+      kind: 'refuse',
+      message: 'The new end would be in the past. To hand back now: /autopilot 0 0 stop.',
+    })
+    expect(retime(run({ phase: 'final', finalReason: 'time' }), to(NOW + HOUR), NOW)).toEqual({
+      kind: 'revive',
+      phase: 'running',
+      waitUntil: null,
+      until: NOW + HOUR,
+      maxRestarts: null,
+    })
+    expect(retime(run({ phase: 'final', finalReason: 'goal' }), to(NOW + HOUR), NOW)).toEqual({
+      kind: 'refuse',
+      message: 'Autopilot is finishing because its goal is met; more time does not change that. Start a new run after it hands back.',
+    })
+    expect(retime(run({ phase: 'running' }), to(NOW + HOUR), NOW)).toEqual({ kind: 'set', until: NOW + HOUR, maxRestarts: null })
+    expect(retime(run({ phase: 'paused' }), to(NOW + HOUR), NOW)).toEqual({ kind: 'set', until: NOW + HOUR, maxRestarts: null })
+  })
+
+  test('the revive prompt names the new end', async () => {
+    const until = Date.UTC(2026, 9, 12, 15, 30)
+    expect(revivePrompt(until, 180)).toContain('until 18:30 (15:30 UTC).')
+    expect(revivePrompt(until, null)).toContain('until 15:30 UTC.')
+    expect(revivePrompt(until, null)).toContain('do not write it now')
+    expect(revivePrompt(until, 180, { used: 3, limit: 5 })).toBe(
+      'Autopilot: the person added restarts (now 3/5); the run continues until 18:30 (15:30 UTC). The final handoff is cancelled: do not write it now. Keep working within your role.',
+    )
+  })
+
+  test('the restart limit is capped at 99 but never below the restarts used', async () => {
+    expect(targetChange({ kind: 'extend', deltaMs: 0, restarts: 2 }, run({ until: 5 * HOUR, restarts: 120, maxRestarts: null }), NOW, 0)).toEqual({
+      until: 5 * HOUR,
+      maxRestarts: 120,
+      note: 'Restart limit capped at 99.',
+    })
+    const ask = { kind: 'extend', deltaMs: 0, restarts: 50 } as const
+    expect(targetChange(ask, run({ until: 5 * HOUR, restarts: 2, maxRestarts: 60 }), NOW, 0)).toEqual({
+      until: 5 * HOUR,
+      maxRestarts: 99,
+      note: 'Restart limit capped at 99.',
+    })
+    expect(targetChange(ask, run({ until: 5 * HOUR, restarts: 2, maxRestarts: 40 }), NOW, 0)).toEqual({
+      until: 5 * HOUR,
+      maxRestarts: 90,
+      note: null,
+    })
   })
 })
 

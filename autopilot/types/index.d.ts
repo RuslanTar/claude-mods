@@ -74,7 +74,8 @@ export type Run = {
 
 export type StartCommand = {
   kind: 'start'
-  durationMs: number
+  /** How long to run, or the next local time reading `hours:minutes`. */
+  end: { kind: 'duration'; ms: number } | { kind: 'clock'; hours: number; minutes: number }
   threshold: number
   maxRestarts: number | null
   role: string
@@ -88,6 +89,9 @@ export type Command =
   | { kind: 'status' }
   | { kind: 'stop' }
   | StartCommand
+  /** deltaMs is 0 when no time was given, restarts 0 when no --restarts. */
+  | { kind: 'extend' | 'shorten'; deltaMs: number; restarts: number }
+  | { kind: 'until'; hours: number; minutes: number }
   | { kind: 'error'; message: string }
 
 /** A token window as `$.session.usage().rateLimits` reports it. */
