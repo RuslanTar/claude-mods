@@ -23,6 +23,7 @@ import {
   graceResumePrompt,
   graceStatusText,
   graceTurnAction,
+  handoffArg,
   identityFromRows,
   isDoneAnswer,
   isGraceEligible,
@@ -48,6 +49,7 @@ import {
   waitText,
   waitTimeoutPrompt,
   wrapMidTurn,
+  wrapupPrompt,
 } from './autopilot'
 
 function run(over: Partial<Run>): Run {
@@ -526,8 +528,9 @@ describe('retiming', () => {
       'Autopilot finished (restarts) at 00:16 UTC; /autopilot extend --restarts N within 10m brings it back from its handoff.',
     )
     expect(graceResumePrompt(Date.UTC(2026, 9, 12, 15, 30), 180)).toBe(
-      'Autopilot: the person brought this run back until 18:30 (15:30 UTC). Call restart_session with the path of the handoff you just wrote under thoughts/shared/handoffs/; autopilot will clear the session and resume from it. Do not start other work first.',
+      'Autopilot: the person brought this run back until 18:30 (15:30 UTC). Call restart_session with {"handoffPath": "<path to the handoff .md>"}, the handoff you just wrote under thoughts/shared/handoffs/; autopilot will clear the session and resume from it. Do not start other work first.',
     )
+    expect(wrapupPrompt(run({}), 60)).toContain('Call restart_session with {"handoffPath": "<path to the handoff .md>"}.')
 
     // against the recorded run, an extend counts from now and revives; a different reason refuses
     const later = NOW + 20 * 60_000
@@ -561,6 +564,14 @@ describe('retiming', () => {
     expect(graceTurnAction(run({ phase: 'wrapping' }))).toBe('none')
     expect(graceTurnAction(run({ phase: 'restarting', isGraceResume: true }))).toBe('none')
     expect(graceTurnAction(run({ phase: 'running', isGraceResume: true }))).toBe('none')
+  })
+
+  test('the restart call may name its path handoffPath or handoff_path', async () => {
+    expect(handoffArg({ handoffPath: 'a.md' })).toBe('a.md')
+    expect(handoffArg({ handoff_path: 'b.md' })).toBe('b.md')
+    expect(handoffArg({ handoffPath: 'a.md', handoff_path: 'b.md' })).toBe('a.md')
+    expect(handoffArg({})).toBe('')
+    expect(handoffArg(null)).toBe('')
   })
 
   test('a grace resume needs a handoff written after the final phase began', async () => {

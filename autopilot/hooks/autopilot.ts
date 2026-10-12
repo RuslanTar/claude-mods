@@ -132,9 +132,16 @@ export function graceHandoffCheck(mtimeMs: number | null, since: number | undefi
   return mtimeMs !== null && mtimeMs >= since ? 'ok' : 'stale'
 }
 
+/** The handoff path a restart call carries: `handoffPath`, or `handoff_path` when the model guessed that name; "" when neither. */
+export function handoffArg(input: unknown): string {
+  const fields = (typeof input === 'object' && input !== null ? input : {}) as { handoffPath?: unknown; handoff_path?: unknown }
+
+  return String(fields.handoffPath ?? fields.handoff_path ?? '')
+}
+
 /** The prompt that makes a finished run restart from the handoff it already wrote. */
 export function graceResumePrompt(until: number, offsetMinutes: number | null): string {
-  return `Autopilot: the person brought this run back until ${endClock(until, offsetMinutes)}. Call ${RESTART_TOOL} with the path of the handoff you just wrote under thoughts/shared/handoffs/; autopilot will clear the session and resume from it. Do not start other work first.`
+  return `Autopilot: the person brought this run back until ${endClock(until, offsetMinutes)}. Call ${RESTART_TOOL} with {"handoffPath": "<path to the handoff .md>"}, the handoff you just wrote under thoughts/shared/handoffs/; autopilot will clear the session and resume from it. Do not start other work first.`
 }
 
 /** The most restarts a limit may reach. */
@@ -969,7 +976,7 @@ export function wrapupPrompt(run: Run, percent: number | null): string {
     '2. Use the /create-handoff-doc skill. Put this block at the very top of the handoff, verbatim, as the initial prompt of the next session, marked as important and not to be ignored:',
     identityLines(run),
     '   Then: the goal of the next stage (you may refine it), what is done, what is next, the decisions you made yourself, and the deferred actions waiting for the person.',
-    `3. Call the ${RESTART_TOOL} tool with the path of the handoff document. It clears this session and resumes from the handoff.`,
+    `3. Call ${RESTART_TOOL} with {"handoffPath": "<path to the handoff .md>"}. It clears this session and resumes from the handoff.`,
   ].join('\n')
 }
 

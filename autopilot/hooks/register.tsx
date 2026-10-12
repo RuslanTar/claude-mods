@@ -26,6 +26,7 @@ import {
   graceHandoffCheck,
   graceStatusText,
   graceTurnAction,
+  handoffArg,
   identityFromRows,
   isDoneAnswer,
   isGraceEligible,
@@ -797,12 +798,12 @@ export const register: Register = on => {
     if (!run || run.phase !== 'wrapping') {
       return { deny: 'Autopilot is not wrapping up: no restart. Continue your work.' }
     }
-    const givenPath = String((e as unknown as { handoffPath?: unknown }).handoffPath ?? '')
+    const givenPath = handoffArg(e)
     const root = await $.session.root()
     if (!isValidHandoffPath(root, givenPath)) {
       await log($, `restart refused: handoff path ${JSON.stringify(givenPath.slice(0, 300))} is not a .md file under thoughts/shared/handoffs/`)
       return {
-        deny: `Refused: the handoff must be a .md file under ${root}/thoughts/shared/handoffs/ (no "..", no control characters). Write it there with /create-handoff-doc, then call ${RESTART_TOOL} with its path.`,
+        deny: `Refused: the handoff must be a .md file under ${root}/thoughts/shared/handoffs/ (no "..", no control characters). Write it there with /create-handoff-doc, then call ${RESTART_TOOL} with its path. Pass it as "handoffPath".`,
       }
     }
     const handoffPath = resolveHandoffPath(root, givenPath)
