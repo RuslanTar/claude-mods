@@ -1,25 +1,44 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { FinalReason, FinishedRecord, Run, TokenWindow } from '../types'
+import type { Avail, AvailCommand, BadgeAvail, Effective, FinalReason, FinishedRecord, LockOwner, Mode, Pending, Run, TokenWindow } from '../types'
 import {
   CONTINUE_PROMPT,
   DEFAULT_CEILING,
   DEFERRED_NOTE,
+  FULL_QUEUE_TOOL,
   FULL_WAIT_TOOL,
+  HEARTBEAT_MS,
   NOT_RUNNING_TEXT,
+  QUEUE_TOOL,
+  QUEUE_WARN,
   RESTART_TOOL,
   RESUME_AFTER_WAIT_PROMPT,
   WAIT_REASONS,
   WAIT_TOOL,
+  addQuestion,
   afterTurn,
+  answeredQuestion,
+  applyAvail,
+  applyMode,
   askAnswer,
   autoAnswersQuestions,
+  availMode,
+  availStatusLines,
+  awayUntil,
+  canDeliver,
+  combinedPingText,
+  criticalCount,
+  deliveredPending,
+  drainingQuestion,
+  effective,
   effectiveTrigger,
+  eligibleForCombined,
   endClock,
   endsWait,
   finalPrompt,
   followsNewSessionId,
   formatLeft,
+  globalFromText,
   goalState,
   goalVerdictsFromRows,
   graceResumePrompt,
@@ -27,6 +46,7 @@ import {
   graceStatusText,
   graceTurnAction,
   handoffArg,
+  humanSubmit,
   identityFromRows,
   isDoneAnswer,
   isGraceEligible,
@@ -35,19 +55,33 @@ import {
   isValidHandoffPath,
   kickoffPrompt,
   limitAction,
+  lockStale,
   namedSkills,
+  parseAskUser,
+  parseAway,
+  parseBack,
+  parseBadgeAvail,
   parseCommand,
+  parseLockOwner,
+  parseQueueInput,
   parseUtcOffset,
   parseWaitInput,
+  pushPending,
+  questionIdFromNote,
+  questionsBlock,
+  queuedAcross,
+  queuedResult,
   resolveHandoffPath,
   restartsText,
   retime,
   revivePrompt,
   roleSection,
   shouldDropStopBlock,
+  sumQueued,
   targetChange,
   triggerCeiling,
   untilFromClock,
+  validAvail,
   waitPhaseRefusal,
   waitPrompt,
   waitRefusal,
@@ -73,6 +107,22 @@ let turnSeq = 0
 let isGoalSet = false
 // The highest context % a handoff may wait for, below auto-compact.
 let ceiling = DEFAULT_CEILING
+// The text of a pending submit that is scheduled and not yet answered; a second one waits for it.
+let flushingText: string | null = null
+// Toasts already shown: held pings (`kind:key`) and global-away toasts (`global:<setAt>`), so each shows once, not every heartbeat.
+const heldToasts = new Set<string>()
+/** Global away `setAt`s whose combined ping this module handed to the model: never pushed again, even when writing `done` failed. */
+const deliveredCombined = new Set<number>()
+// Whether the prompt that starts the next turn is the person's answer during a drain.
+// A reload resets it: no question leaves the queue until this module sees the person write.
+let lastSubmitHuman = false
+// The availability records as last read: this session's ($.store) and the global one (global.json).
+let sessionAvail: Avail | null = null
+let globalAvail: Avail | null = null
+// global.json's mtime at the last read; the heartbeat re-reads it only when this changes.
+let globalMtime: number | null = null
+// When the badge last carried a heartbeat time.
+let lastBeat = 0
 
 /**
  * Reads the session's auto-compact threshold and sets the ceiling below it.
@@ -93,6 +143,7 @@ async function readCeiling($: EngineInterface): Promise<number> {
 
 const storeKey = (id: string) => `run:${id}`
 const finishedKey = (id: string) => `finished:${id}`
+const availKey = (id: string) => `away:${id}`
 
 /** The record of a run that finished on time or restarts, while the grace period lasts; an expired one is deleted. */
 async function loadFinished($: EngineInterface, now: number): Promise<FinishedRecord | null> {
@@ -105,7 +156,10 @@ async function loadFinished($: EngineInterface, now: number): Promise<FinishedRe
   return null
 }
 
-/** Deletes every finished-run record, of any session, that is past its grace period or malformed. */
+/** A combined-ping lock lives this long; then the sweep removes it. */
+const LOCK_TTL_MS = 24 * 60 * 60_000
+
+/** Deletes every finished-run record, of any session, that is past its grace period or malformed, and old combined-ping locks. */
 async function sweepFinished($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
   for (const key of await $.store.keys()) {
@@ -113,9 +167,26 @@ async function sweepFinished($: EngineInterface): Promise<void> {
     const value = await $.store.get(key)
     if (!isLiveFinishedValue(value, now)) await $.store.delete(key)
   }
+  if (!home) return
+  const entries = await $.fs.list(statusDir()).catch(() => [])
+  for (const entry of entries) {
+    if (!/^ping-\d+\.lock$/.test(entry.name)) continue
+    const path = `${statusDir()}/${entry.name}`
+    if (entry.kind !== 'dir') {
+      // A file or a link under a lock's name is not ours and blocks the combined ping for good.
+      await $.process.run(['/bin/rm', '-f', '--', path]).catch(() => undefined)
+      continue
+    }
+    // A list entry's mtimeMs is 0 for a directory, so stat it; a failed stat or a missing mtime keeps the lock.
+    const stat = await $.fs.stat(path).catch(() => null)
+    if (!stat || !(now - stat.mtimeMs >= LOCK_TTL_MS)) continue
+    await $.process.run(['/bin/rm', '-rf', '--', path]).catch(() => undefined)
+  }
 }
 
 const autopilotDir =() => `${home}/.claude/autopilot`
+const statusDir = () => `${autopilotDir()}/status`
+const globalFile = () => `${statusDir()}/global.json`
 
 /** The machine's UTC offset in minutes east of UTC (`date +%z`); null when it cannot be read. */
 async function utcOffset($: EngineInterface): Promise<number | null> {
@@ -128,8 +199,82 @@ async function utcOffset($: EngineInterface): Promise<number | null> {
   }
 }
 
+/** This session's availability record, read again from the store; null when none or malformed. */
+async function readSessionAvail($: EngineInterface): Promise<Avail | null> {
+  if (!sessionId) {
+    sessionAvail = null
+    return null
+  }
+  const value = await $.store.get(availKey(sessionId)).catch(() => undefined)
+  sessionAvail = validAvail(value, await $.clock.now())
+
+  return sessionAvail
+}
+
+async function writeSessionAvail($: EngineInterface, rec: Avail): Promise<void> {
+  if (!sessionId) return
+  await $.store.set(availKey(sessionId), rec)
+  sessionAvail = rec
+}
+
+/**
+ * The global record. Re-read only when global.json changed (or `force`); a
+ * missing, empty, half-written or future-dated file keeps the last good value.
+ * Never throws.
+ */
+async function readGlobalAvail($: EngineInterface, force = false): Promise<Avail | null> {
+  if (!home) return globalAvail
+  const stat = await $.fs.stat(globalFile()).catch(() => null)
+  if (!stat) return globalAvail
+  if (!force && stat.mtimeMs === globalMtime) return globalAvail
+  const isFirstRead = globalMtime === null
+  const text = await $.fs.read(globalFile()).catch(() => null)
+  const previous = globalAvail
+  globalAvail = globalFromText(text, await $.clock.now(), globalAvail)
+  globalMtime = stat.mtimeMs
+  // A change this session did not write (another session's --global, or anything else that
+  // wrote the file): the person sees it, not only the log.
+  if (!isFirstRead && JSON.stringify(previous) !== JSON.stringify(globalAvail)) {
+    $.ui.toast(`Autopilot: the global away/ask-user status changed outside this session (${globalFile()}); /autopilot shows it.`)
+    await log($, `global status changed outside this session: ${JSON.stringify(globalAvail)}`)
+  }
+
+  return globalAvail
+}
+
+/** Writes global.json for every session: a temp file of this session, then an atomic rename. */
+async function writeGlobalAvail($: EngineInterface, rec: Avail): Promise<void> {
+  if (!home) throw new Error('HOME is not set')
+  const target = await $.fs.stat(globalFile()).catch(() => null)
+  if (target && (target.kind !== 'file' || target.isLink)) throw new Error(`${globalFile()} is not a regular file`)
+  const tmp = `${globalFile()}.tmp-${sessionId}`
+  const stale = await $.fs.stat(tmp).catch(() => null)
+  if (stale) await $.process.run(['/bin/rm', '-f', '--', tmp])
+  await $.fs.write(tmp, JSON.stringify(rec))
+  const moved = await $.process.run(['/bin/mv', '-f', '--', tmp, globalFile()])
+  if (moved.exitCode !== 0) throw new Error(`could not write ${globalFile()}: ${moved.stderr.trim()}`)
+  const written = await $.fs.stat(globalFile()).catch(() => null)
+  if (!written || written.kind !== 'file') throw new Error(`${globalFile()} is not a file after the write`)
+  globalAvail = rec
+  globalMtime = written.mtimeMs
+}
+
+/** The effective status: session record over global record per field, else the run's --ask-user flag. */
+async function currentEffective($: EngineInterface): Promise<Effective> {
+  await readSessionAvail($)
+  await readGlobalAvail($)
+
+  return effective(run, sessionAvail, globalAvail)
+}
+
+/** Whether questions go to the person now, from the records as last read (no I/O). */
+function askOnNow(): boolean {
+  return effective(run, sessionAvail, globalAvail).askOn
+}
+
 async function save($: EngineInterface): Promise<void> {
   if (!sessionId) return
+  const now = await $.clock.now()
   if (!run) {
     await $.store.delete(storeKey(sessionId))
     if (home) await $.fs.write(`${autopilotDir()}/${sessionId}.json`, JSON.stringify({ isOn: false }))
@@ -137,7 +282,9 @@ async function save($: EngineInterface): Promise<void> {
   }
   await $.store.set(storeKey(sessionId), run)
   if (!home) return
-  // Read by the fleet dashboard for its badge.
+  const eff = effective(run, sessionAvail, globalAvail)
+  // Read by the fleet dashboard for its badge; the last four fields only by the combined ping,
+  // which counts only questions that will be asked: none while asking is off (D4).
   await $.fs.write(
     `${autopilotDir()}/${sessionId}.json`,
     JSON.stringify({
@@ -152,8 +299,13 @@ async function save($: EngineInterface): Promise<void> {
       waitingFor: run.awaiting?.reason ?? null,
       waitingFrom: run.awaiting?.from ?? null,
       waitingSince: run.awaiting?.since ?? null,
+      queued: eff.askOn ? (run.questions?.length ?? 0) : 0,
+      awaySource: eff.awaySource,
+      awaySetAt: eff.away?.setAt ?? null,
+      beat: now,
     }),
   )
+  lastBeat = now
 }
 
 /** Appends one line to this session's autopilot log: decisions, deferrals, restarts. */
@@ -267,9 +419,10 @@ async function refreshIdentity($: EngineInterface): Promise<void> {
 
 /**
  * /clear and /resume change the session id under a running module. Only the
- * run's own /clear (phase restarting) moves it to the new id; any other new
- * id is another conversation, which the run does not drive: it stays stored
- * under its old id, and the new id's own run, if any, is loaded.
+ * run's own /clear (phase restarting) moves it to the new id, with this
+ * session's availability record; any other new id is another conversation,
+ * which the run does not drive: it stays stored under its old id, and the new
+ * id's own run and record, if any, are loaded.
  */
 async function syncId($: EngineInterface): Promise<void> {
   const id = await $.session.id()
@@ -277,11 +430,45 @@ async function syncId($: EngineInterface): Promise<void> {
   const previous = sessionId
   sessionId = id
   if (run && followsNewSessionId(run.phase)) {
-    if (previous) await $.store.delete(storeKey(previous))
+    if (previous) {
+      await $.store.delete(storeKey(previous))
+      const away = await $.store.get(availKey(previous))
+      if (away !== undefined) {
+        await $.store.set(availKey(id), away)
+        await $.store.delete(availKey(previous))
+      }
+    }
     await save($)
     return
   }
   run = ((await $.store.get(storeKey(id))) as Run | undefined) ?? null
+  await readSessionAvail($)
+}
+
+/**
+ * The mode rule, one place for every trigger (spec §5.1): recomputes the
+ * mode from the records, applies its effects to the run and saves. Saves
+ * at least every half heartbeat, so the badge's `beat` stays fresh. Null
+ * when no run.
+ */
+async function refreshMode($: EngineInterface): Promise<Mode | null> {
+  await currentEffective($)
+  const now = await $.clock.now()
+  if (!run) return null
+  // Decided and applied with no await in between: a parallel trigger acts on the result.
+  const eff = effective(run, sessionAvail, globalAvail)
+  const prev = run.lastMode ?? null
+  const before = JSON.stringify(run)
+  const next = availMode(run, eff, now)
+  const applied = applyMode(run, next, eff, now)
+  run = applied.run
+  const isChanged = JSON.stringify(run) !== before
+  if (isChanged || now - lastBeat >= HEARTBEAT_MS / 2) await save($)
+  if (prev !== next) await log($, `availability mode ${prev ?? 'none'} -> ${next}`)
+  // Informational: the combined ping itself comes from the heartbeat's combinedTick (task 10).
+  if (applied.combined) await log($, 'global away over here: the combined ping is decided by the heartbeat')
+
+  return next
 }
 
 /** Moves the run to its final phase; the goal loop stops so it cannot outrun the handoff. */
@@ -414,14 +601,247 @@ async function checkWaitTimeout($: EngineInterface, now: number): Promise<void> 
   queue($, waitTimeoutPrompt(awaiting, now))
 }
 
-function statusText(now: number): string {
+/** The combined-ping lock of the global away set at `setAt` (a directory: mkdir is atomic). */
+const lockDir = (setAt: number) => `${statusDir()}/ping-${setAt}.lock`
+
+async function readLockOwner($: EngineInterface, dir: string): Promise<LockOwner | null> {
+  try {
+    return parseLockOwner(JSON.parse(await $.fs.read(`${dir}/owner.json`)))
+  } catch {
+    return null
+  }
+}
+
+/** The away fields of every session's badge; a missing, half-written or old badge is skipped. */
+async function readBadges($: EngineInterface): Promise<BadgeAvail[]> {
+  const entries = await $.fs.list(autopilotDir()).catch(() => [])
+  const badges: BadgeAvail[] = []
+  for (const entry of entries) {
+    if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
+    try {
+      const badge = parseBadgeAvail(JSON.parse(await $.fs.read(`${autopilotDir()}/${entry.name}`)))
+      if (badge) badges.push(badge)
+    } catch {
+      continue
+    }
+  }
+
+  return badges
+}
+
+/**
+ * Makes the lock (mkdir fails when it exists) or takes over one whose owner
+ * stopped refreshing it. Either way this session acts as owner from the next
+ * heartbeat on, if `owner.json` still names it then.
+ */
+async function claimLock($: EngineInterface, dir: string, owner: LockOwner | null, now: number): Promise<void> {
+  const made = await $.process.run(['/bin/mkdir', dir]).catch(() => null)
+  const isNew = made?.exitCode === 0
+  if (!isNew) {
+    const stat = await $.fs.stat(dir).catch(() => null)
+    if (!stat || stat.kind !== 'dir' || stat.isLink) {
+      await log($, `combined ping: ${dir} is not a directory; left alone`)
+      return
+    }
+    if (!lockStale(owner, false, now)) return
+  }
+  await $.fs.write(`${dir}/owner.json`, JSON.stringify({ sid: sessionId, at: now }))
+  await log($, isNew ? `combined ping: took the lock ${dir}` : `combined ping: took over a stale lock ${dir} (owner ${owner?.sid.slice(0, 64) ?? 'unknown'})`)
+}
+
+/**
+ * A session on the global away that sends no combined ping ("others only
+ * toast", §7.3): one toast per away, one heartbeat after the expiry, only
+ * when questions are queued somewhere (R7).
+ */
+async function toastGlobal($: EngineInterface, away: { until: number; setAt: number }, now: number, tail: string): Promise<void> {
+  const id = `global:${away.setAt}`
+  if (heldToasts.has(id)) return
+  // One heartbeat after the expiry every live badge is fresh, as for the owner's sum.
+  if (now < away.until + HEARTBEAT_MS) return
+  heldToasts.add(id)
+  const { total, sessions } = sumQueued(await readBadges($), away.setAt, now)
+  if (total === 0) return
+  $.ui.toast(`Autopilot: the global away time is over; ${queuedAcross(total, sessions)}. ${tail}`)
+}
+
+/**
+ * One heartbeat of the combined ping (§7.3, R9). Only an eligible session
+ * (a live run on that global away, asking on, away over) touches the lock, so
+ * a session with no run never gets a prompt. The owner waits one heartbeat
+ * after the expiry, sums the live badges and queues one `combined-ping`;
+ * `done` is written when that ping is handed to the model. Every other run on
+ * the same away only toasts, once.
+ */
+async function combinedTick($: EngineInterface): Promise<void> {
+  if (!home || !run) return
+  const global = await readGlobalAvail($)
+  const away = global?.away ?? null
+  if (!away || !('until' in away)) return
+  const now = await $.clock.now()
+  // A day after the expiry the ping is moot and the sweep may have removed its lock: never a late or second one.
+  const isLate = now - away.until >= LOCK_TTL_MS
+  const isHeld = (run?.pending ?? []).some(p => p.kind === 'combined-ping' && p.key === away.setAt)
+  if (isLate && isHeld && run) {
+    // One held since (a parked run) goes too: a day late it would only mislead.
+    run = { ...run, pending: (run.pending ?? []).filter(p => !(p.kind === 'combined-ping' && p.key === away.setAt)) }
+    await save($)
+  }
+  if (isLate) return
+  // This module already handed it to the model (writing `done` may have failed).
+  if (deliveredCombined.has(away.setAt)) return
+  const eff = await currentEffective($)
+  // Stopped while the files were read.
+  if (!run) return
+  const dir = lockDir(away.setAt)
+  // The owner holding its undelivered combined ping keeps the lock alive, eligible or not
+  // (parked, or its own away changed): nobody takes over and sends a second ping (R9).
+  if ((run.pending ?? []).some(p => p.kind === 'combined-ping' && p.key === away.setAt)) {
+    await $.fs.write(`${dir}/owner.json`, JSON.stringify({ sid: sessionId, at: now }))
+    return
+  }
+  // A session record beats the global one (R5), or asking is off (D4): this away is not ours.
+  const isOnThisAway = eff.awaySource === 'global' && !!eff.away && 'until' in eff.away && eff.away.setAt === away.setAt && eff.askOn
+  if (!isOnThisAway) return
+  const mode = availMode(run, eff, now)
+  // The person is back here: this session neither sends nor keeps the lock; after two beats
+  // another session with questions takes it over and sends the one ping (editor's decision 2026-10-14).
+  if (mode === 'draining') return
+  if (!eligibleForCombined(run, eff, mode, away.setAt)) {
+    // Parked, paused or wrapping: no prompt now, the person learns of it from a toast.
+    if (run.phase !== 'running' && run.phase !== 'awaiting') {
+      await toastGlobal($, away, now, `This session asks once it is back to work (now ${run.phase}).`)
+    }
+    return
+  }
+
+  const owner = await readLockOwner($, dir)
+  if (await $.fs.exists(`${dir}/done`)) {
+    // Another session sent the notification; the owner toasted when it delivered.
+    if (owner?.sid !== sessionId) await toastGlobal($, away, now, 'Another session sent the notification; write here to answer this one.')
+    return
+  }
+  if (owner?.sid !== sessionId) {
+    await claimLock($, dir, owner, now)
+    return
+  }
+  // Still alive: no one takes over while the owner waits for the sum.
+  await $.fs.write(`${dir}/owner.json`, JSON.stringify({ sid: sessionId, at: now }))
+  // One heartbeat after the expiry every live session has refreshed its badge.
+  if (now < away.until + HEARTBEAT_MS) return
+
+  const { total, sessions } = sumQueued(await readBadges($), away.setAt, now)
+  if (total === 0) {
+    // Nothing queued anywhere: silently over (R7).
+    await $.fs.write(`${dir}/done`, String(now))
+    await log($, 'combined ping: global away over, no questions queued in any session')
+    return
+  }
+  if (!run) return
+  run = pushPending(run, { kind: 'combined-ping', text: combinedPingText(total, sessions), key: away.setAt })
+  await save($)
+  await log($, `combined ping: ${total} questions in ${sessions} sessions, pending delivery`)
+}
+
+/** A run that cannot take a prompt now (parked, paused, wrapping…): the person still learns of a ping, once. */
+function toastHeld($: EngineInterface, items: readonly Pending[], phase: string): void {
+  for (const pending of items) {
+    if (pending.kind !== 'ping' && pending.kind !== 'combined-ping') continue
+    const id = `${pending.kind}:${pending.key}`
+    if (heldToasts.has(id)) continue
+    heldToasts.add(id)
+    const when = phase === 'final' ? 'the run is finishing, so they go into its handoff' : `the session tells you once it is back to work (now ${phase})`
+    $.ui.toast(`Autopilot: away time is over and questions are queued; ${when}.`)
+  }
+}
+
+/** Records entries handed to the model: saved, logged, pings toasted, a combined ping's lock marked done. */
+async function markDelivered($: EngineInterface, items: readonly Pending[], via: 'tool' | 'turn' | 'idle'): Promise<void> {
+  // First, before any await that can fail: a combined ping handed over is never pushed again.
+  for (const pending of items) if (pending.kind === 'combined-ping') deliveredCombined.add(pending.key)
+  await save($)
+  for (const pending of items) {
+    heldToasts.delete(`${pending.kind}:${pending.key}`)
+    await log($, `delivered ${pending.kind} (${via})`)
+    if (pending.kind === 'ping') {
+      $.ui.toast(`Autopilot: away time is over; ${criticalCount(run?.questions?.length ?? 0)} queued.`)
+    }
+    if (pending.kind !== 'combined-ping') continue
+    $.ui.toast('Autopilot: away time is over; critical questions are queued in your sessions.')
+    if (!home) continue
+    await $.fs
+      .write(`${lockDir(pending.key)}/done`, String(await $.clock.now()))
+      .catch(async error => log($, `combined ping: could not mark the lock done: ${String(error)}`))
+  }
+}
+
+/**
+ * Submits pending entries once the session is idle. They leave the queue
+ * before the submit, so a tool call of the turn it starts cannot hand them
+ * over again; a dropped or failed submit puts them back.
+ */
+async function submitPending($: EngineInterface, items: readonly Pending[], via: 'turn' | 'idle'): Promise<void> {
+  try {
+    // A turn started meanwhile (the person, the goal loop) or the run moved on: they stay pending.
+    if (isTurnRunning || !run || !canDeliver(run.phase)) return
+    const pending = run.pending ?? []
+    // A tool call may have taken some already.
+    const taken = items.filter(item => pending.some(p => p.kind === item.kind && p.key === item.key))
+    if (taken.length === 0) return
+    run = taken.reduce((acc, item) => deliveredPending(acc, item), run)
+    const answer = await $.prompt.submit({ text: taken.map(item => item.text).join('\n\n') }).catch(() => null)
+    if (answer && answer.drop === undefined) {
+      await markDelivered($, taken, via).catch(error => log($, `could not record a delivery: ${String(error)}`).catch(() => undefined))
+      return
+    }
+    if (run) run = taken.reduce((acc, item) => pushPending(acc, item), run)
+    await save($)
+    await log($, `pending prompt not delivered (${via}): ${answer?.drop ?? 'the submit failed'}`)
+  } finally {
+    flushingText = null
+  }
+}
+
+/**
+ * Hands `run.pending` to the model (§7.1). `tool`: taken now, the text goes
+ * into the tool result's context. `turn` / `idle`: one submit once idle; the
+ * text returned means a prompt is on its way, so the caller queues nothing
+ * else. Null when nothing is pending or the phase cannot take a prompt.
+ */
+async function flushPending($: EngineInterface, via: 'tool' | 'turn' | 'idle'): Promise<string | null> {
+  if (!run) return null
+  const items = run.pending ?? []
+  if (items.length === 0) return null
+  if (!canDeliver(run.phase)) {
+    toastHeld($, items, run.phase)
+    return null
+  }
+  const text = items.map(item => item.text).join('\n\n')
+  if (via === 'tool') {
+    // Taken before the first await: a parallel tool call finds nothing left.
+    run = items.reduce((acc, item) => deliveredPending(acc, item), run)
+    // Taken: the text goes to the model whatever the bookkeeping does.
+    await markDelivered($, items, via).catch(error => log($, `could not record a delivery: ${String(error)}`).catch(() => undefined))
+
+    return text
+  }
+  if (flushingText !== null) return flushingText
+  flushingText = text
+  const submitVia: 'turn' | 'idle' = via
+  $.clock.after(300, () => void submitPending($, items, submitVia).catch(error => log($, `pending submit failed: ${String(error)}`).catch(() => undefined)))
+
+  return text
+}
+
+/** `isAskShown` false when the caller appends availStatusLines, which has its own ask-user line. */
+function statusText(now: number, isAskShown = true): string {
   if (!run) return 'Autopilot is off.'
 
   return [
     `Autopilot: ${run.phase}${run.waitUntil ? ` until ${endClock(run.waitUntil, null)}` : ''} · ${formatLeft(run.until - now)} left · handoff at ${effectiveTrigger(run, ceiling)}% (asked ${run.threshold}%, ceiling ${ceiling}% below auto-compact) · restarts ${restartsText(run)}`,
     ...waitingLines(now),
     `Token limits: park at ${run.fiveHourStop}% of the 5-hour window, stop at ${run.weekStop}% of the week`,
-    ...(run.askUser === true ? ['Asks the person: critical only'] : []),
+    ...(isAskShown && askOnNow() ? ['Asks the person: critical only'] : []),
     `Role: ${run.role}`,
     ...(run.skills.length ? [`Skills recognised in the role: ${run.skills.map(name => `/${name}`).join(', ')}`] : []),
     ...(run.goal ? [`Goal: ${run.goal}${isGoalSet ? '' : ' (not set right now)'}`] : []),
@@ -429,17 +849,145 @@ function statusText(now: number): string {
   ].join('\n')
 }
 
+const AVAIL_FAILED_TEXT = 'Autopilot: the command failed; nothing changed. Try again.'
+
+/** The first line of an /away, /back or /ask-user reply: what was recorded, and for whom. */
+function availHeadline(cmd: Exclude<AvailCommand, { kind: 'error' }>, until: number | null, offset: number | null): string {
+  const scope = cmd.global ? 'all sessions' : 'this session'
+  if (cmd.kind === 'away') return `Away until ${endClock(until ?? 0, offset)} (${scope}).`
+  if (cmd.kind === 'back') return `Back (${scope}).`
+
+  return `Ask-user ${cmd.on ? 'on' : 'off'} (${scope}).`
+}
+
+/**
+ * /away, /back and /ask-user: the person's own availability. Stored even with
+ * no run, so it applies to a later one (R4). Errors write nothing; a record
+ * written at its scope goes through the mode rule, which may release a wait,
+ * start a drain or queue a ping.
+ */
+async function setAvail($: EngineInterface, isPerson: boolean, cmd: AvailCommand, typed: string): Promise<{ text: string }> {
+  await syncId($)
+  if (!isPerson) {
+    await log($, `${typed} refused: not typed by the person`)
+
+    return { text: 'Only the person can say they are away or back, or turn asking on or off (type it in the prompt or over Remote Control).' }
+  }
+  if (cmd.kind === 'error') {
+    $.ui.toast(`Autopilot: ${cmd.message}`)
+
+    return { text: cmd.message }
+  }
+  if (cmd.global && !home) {
+    const text = 'Cannot use --global: HOME is not set, so there is no shared status file. Leave out --global to set it for this session.'
+    $.ui.toast(`Autopilot: ${text}`)
+
+    return { text }
+  }
+  // A clock end needs the offset; every reply shows times in it.
+  const offset = await utcOffset($)
+  // The process call took time: decide on the clock as it is now.
+  const now = await $.clock.now()
+  let until: number | null = null
+  if (cmd.kind === 'away') {
+    if (cmd.end.kind === 'clock' && offset === null) {
+      const text = 'Cannot read the local time zone; use a duration such as /away for 2h instead.'
+      $.ui.toast(`Autopilot: ${text}`)
+
+      return { text }
+    }
+    const end = awayUntil(cmd.end, now, offset ?? 0)
+    if (typeof end === 'string') {
+      $.ui.toast(`Autopilot: ${end}`)
+
+      return { text: end }
+    }
+    until = end
+  }
+
+  const session = await readSessionAvail($)
+  // The global file may have changed in another session since the last heartbeat.
+  const before = cmd.global ? await readGlobalAvail($, true) : session
+  const next = applyAvail(before, cmd, until, now)
+  try {
+    if (cmd.global) await writeGlobalAvail($, next)
+    else await writeSessionAvail($, next)
+  } catch (error) {
+    await log($, `could not record ${typed}: ${String(error)}`).catch(() => undefined)
+
+    return { text: 'Autopilot could not record the change; nothing changed.' }
+  }
+  const headline = availHeadline(cmd, until, offset)
+  await log($, `set by the person: ${headline}`).catch(() => undefined)
+
+  // The record is written: a failure from here on must not claim that nothing changed.
+  const mode = await refreshMode($).catch(async (error: unknown) => {
+    await log($, `recorded ${typed}, but applying it failed: ${String(error)}`).catch(() => undefined)
+
+    return undefined
+  })
+  if (mode === undefined) return { text: `${headline} Recorded; applying it to the run failed, so it takes effect at the next turn.` }
+  // refreshMode just read both records: the cached ones are current, no second read.
+  const eff = effective(run, sessionAvail, globalAvail)
+  // A session record beats the global one per field, even when older (R5).
+  const shadowed = cmd.global && (cmd.kind === 'ask-user' ? session?.askUser : session?.away)
+  const notes = [
+    ...(shadowed ? [`Note: this session has its own ${cmd.kind === 'ask-user' ? 'ask-user' : 'away'} setting, which wins over the global one here.`] : []),
+    ...(cmd.kind === 'away' && mode === 'plain'
+      ? ['Note: this run does not ask you (no --ask-user), so being away changes nothing until /ask-user on.']
+      : []),
+  ]
+
+  return { text: [headline, ...notes, ...availStatusLines(eff, mode, run, now, offset)].join('\n') }
+}
+
+const QUEUE_FAILED_TEXT =
+  'Autopilot could not queue the question. Decide it yourself within your role, record the decision for the handoff, and continue.'
+const NO_QUEUE_TEXT = 'Autopilot is not driving right now: no queue.'
+
+/** Why queue_question is refused in this mode, or null when it is accepted. */
+function queueRefusal(mode: Mode | null): string | null {
+  if (mode === 'queueing' || mode === 'overdue' || mode === 'draining') return null
+  if (mode === 'asking') {
+    return `The person can be asked right now: do not queue. If they are truly required, send one PushNotification with the question, call ${WAIT_TOOL} with reason user-answer (or user-input) and the question as note, and end your turn.`
+  }
+  if (mode === 'plain') return 'This run does not ask the person (no --ask-user): decide yourself within your role, record the decision for the handoff, and continue.'
+
+  return NO_QUEUE_TEXT
+}
+
+/**
+ * The person answered during a drain: their question leaves the queue (the
+ * tagged wait's, else the one the role section named). Runs before endWait,
+ * which drops the wait and its tag. Nothing removed (no id, or the id is no
+ * longer queued): nothing saved, nothing logged.
+ */
+async function removeAnswered($: EngineInterface): Promise<void> {
+  if (!run) return
+  const id = run.awaiting?.questionId ?? run.askingId ?? null
+  if (id === null) return
+  const before = run.questions?.length ?? 0
+  run = answeredQuestion(run)
+  if ((run.questions?.length ?? 0) === before) return
+  await save($)
+  await log($, `the person answered #${id}: ${run?.questions?.length ?? 0} questions left`)
+  await refreshMode($)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const rawHome = (await $.env.get('HOME')) ?? ''
     home = rawHome.startsWith('/') ? rawHome : ''
-    // State and logs are the person's alone: the folder is closed to other users.
+    // State and logs are the person's alone: the folders are closed to other users.
     if (home) {
-      await $.process.run(['/bin/mkdir', '-p', autopilotDir()]).catch(() => undefined)
-      await $.process.run(['/bin/chmod', '700', autopilotDir()]).catch(() => undefined)
+      await $.process.run(['/bin/mkdir', '-p', autopilotDir(), statusDir()]).catch(() => undefined)
+      await $.process.run(['/bin/chmod', '700', autopilotDir(), statusDir()]).catch(() => undefined)
     }
     sessionId = await $.session.id()
     run = ((await $.store.get(storeKey(sessionId))) as Run | undefined) ?? null
+    // The status applies even before a run starts (R4); a reload re-reads both records.
+    await readSessionAvail($)
+    await readGlobalAvail($, true)
     await readCeiling($)
     // Records of runs that finished long ago go; best effort, off the start's path.
     void sweepFinished($).catch(() => undefined)
@@ -448,6 +996,25 @@ export const register: Register = on => {
       name: 'autopilot',
       description: 'Run this session on autopilot with a fixed role; no args shows status, "extend|shorten [<time>] [--restarts N]" and "until 18:30|6:30pm" change the end, "0 0 stop" hands back',
       argumentHint: '<time | until 18:30|6:30pm> <threshold%> [max restarts] "<role>" [--goal "…"] [--5h 95] [--week 80] [--ask-user] | extend|shorten [<time>] [--restarts N] | until 18:30|6:30pm | 0 0 stop',
+    })
+    // Immediate: typed mid-turn they run at once, so stepping away never waits for a long turn.
+    await $.command.register({
+      name: 'away',
+      description: 'Autopilot: you are away; critical questions are queued instead of asked, then asked one by one when you are back',
+      argumentHint: 'for <90m|2h|1h30m> | until <15:00|6pm> [--global]',
+      immediate: true,
+    })
+    await $.command.register({
+      name: 'back',
+      description: 'Autopilot: you are back; the queued questions are asked one by one',
+      argumentHint: '[--global]',
+      immediate: true,
+    })
+    await $.command.register({
+      name: 'ask-user',
+      description: 'Autopilot: turn asking you critical questions on or off (off queues them until you turn it on)',
+      argumentHint: 'on|off [--global]',
+      immediate: true,
     })
     await $.tool.register({
       name: RESTART_TOOL,
@@ -479,21 +1046,48 @@ export const register: Register = on => {
         required: ['reason'],
       },
     })
+    await $.tool.register({
+      name: QUEUE_TOOL,
+      description: `Autopilot only: while the person is away or has asking turned off, parks a critical question (one you would otherwise stop for with ${WAIT_TOOL} user-answer) for them to answer later, one by one. Keep working on what is not blocked by it. Refused when the person can be asked directly.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: 'The question or the action for the person, in one line, as they will read it' },
+          kind: { type: 'string', enum: ['answer', 'action'], description: 'answer: a decision only the person can make; action: something the person must do' },
+          provisional: { type: 'string', description: 'What you do meanwhile, if anything (prefer a reversible default)' },
+        },
+        required: ['question', 'kind'],
+      },
+    })
 
     // Time and the 5-hour reset can come while the session sits idle (or after a reload lost the timers).
-    $.clock.every(30_000, () => {
+    $.clock.every(HEARTBEAT_MS, () => {
       void (async () => {
         await syncId($)
+        // Before the idle guard: an away running out or a global change by another
+        // session (R2) changes the mode mid-turn too. No run: nothing is ever queued.
+        // refreshMode also saves at least every half heartbeat, which keeps the badge's
+        // beat fresh for the combined ping (live sessions only); no second save here.
+        await refreshMode($).catch(error => log($, `mode refresh failed: ${String(error)}`).catch(() => undefined))
+        await combinedTick($).catch(async error => log($, `combined ping failed: ${String(error)}`))
         if (!run || isTurnRunning) return
         const now = await $.clock.now()
+        // The clock read is an await: the run may have ended meanwhile.
+        if (!run) return
         if ((run.phase === 'running' || run.phase === 'waiting' || run.phase === 'awaiting') && now >= run.until) {
           const instruction = await enterFinal($, 'time')
           if (instruction) queue($, instruction)
           return
         }
-        if (run.phase === 'waiting' && run.waitUntil && now >= run.waitUntil) await wake($)
+        if (run.phase === 'waiting' && run.waitUntil && now >= run.waitUntil) {
+          // The resumed turn's first tool call, or its end, carries what is pending.
+          await wake($)
+          return
+        }
+        // A delivered prompt wakes a wait too: its timeout check can wait a beat.
+        if (await flushPending($, 'idle')) return
         await checkWaitTimeout($, now)
-      })()
+      })().catch(error => log($, `heartbeat failed: ${String(error)}`).catch(() => undefined))
     })
 
     return next(e)
@@ -506,8 +1100,17 @@ export const register: Register = on => {
 
     if (command.kind === 'status') {
       const finished = run ? null : await loadFinished($, now)
+      // The records first, so the status reads them fresh, not as of the last heartbeat.
+      // A failed refresh must not hide the status: show it from the cached records.
+      const mode = await refreshMode($).catch(() => null)
+      // availStatusLines carries the one ask-user line, so statusText leaves its own out.
+      const text = finished ? graceStatusText(finished, now) : statusText(now, false)
+      // Away and ask-user show with or without a run, with their source (session or global).
+      const offset = await utcOffset($)
+      // refreshMode read both records (also with no run): the cached ones are current.
+      const lines = availStatusLines(effective(run, sessionAvail, globalAvail), mode, run, now, offset)
 
-      return { text: finished ? graceStatusText(finished, now) : statusText(now) }
+      return { text: [text, ...lines].join('\n') }
     }
     if (command.kind === 'error') return { text: command.message }
     if (command.kind === 'extend' || command.kind === 'shorten' || command.kind === 'until') {
@@ -625,13 +1228,15 @@ export const register: Register = on => {
     }
     if (command.kind === 'stop') {
       if (run) await log($, 'stopped by the person')
+      // A stopped run asks nothing more: its open questions go to the person in the reply.
+      const open = run ? questionsBlock(run) : ''
       await $.store.delete(finishedKey(sessionId)).catch(() => undefined)
       await clearGoal($)
       run = null
       await save($)
       $.ui.status(undefined)
 
-      return { text: 'Autopilot is off. You have the wheel.' }
+      return { text: open ? `Autopilot is off. You have the wheel.\n${open}` : 'Autopilot is off. You have the wheel.' }
     }
 
     // A clock end is under 24 hours ahead, so the 7-day cap cannot be hit.
@@ -653,6 +1258,9 @@ export const register: Register = on => {
 
     const [identity, commands] = await Promise.all([readIdentity($), $.command.list().catch(() => [])])
     const skillNames = commands.filter(info => info.source !== 'builtin').map(info => info.name)
+    // A new run in this session keeps what the run it replaces still had queued (a paused run is started again this way): no question is lost.
+    const kept = run?.questions?.length ? { questions: run.questions, nextQuestionId: run.nextQuestionId, drain: run.drain, pingedFor: run.pingedFor } : {}
+    const keptNote = kept.questions ? `\nKept from the previous run: ${criticalCount(kept.questions.length)} queued for you.` : ''
     run = {
       role: command.role,
       name: identity.name,
@@ -673,6 +1281,7 @@ export const register: Register = on => {
       finalReason: null,
       awaiting: null,
       askUser: command.askUser,
+      ...kept,
     }
     await save($)
     await $.store.delete(finishedKey(sessionId)).catch(() => undefined)
@@ -695,17 +1304,44 @@ export const register: Register = on => {
       })()
     })
 
-    return { text: `${statusText(now)}\nEnd: ${endClock(until, startOffset)}, ${formatLeft(until - now)} left.${capNote}\nStop any time with /autopilot 0 0 stop.` }
+    return { text: `${statusText(now)}\nEnd: ${endClock(until, startOffset)}, ${formatLeft(until - now)} left.${capNote}${keptNote}\nStop any time with /autopilot 0 0 stop.` }
   }).catch(() => ({ text: 'Autopilot: the command failed; nothing changed. Try again.' }))
+
+  // Human-only: another plugin, a peer or the SDK may not say the person is away or back.
+  const isPerson = (kind: string) => kind === 'composer' || kind === 'bridge'
+
+  on('command.run', { command: 'away' }, async ($, e) => setAvail($, isPerson(e.origin.kind), parseAway(e.args), '/away')).catch(() => ({
+    text: AVAIL_FAILED_TEXT,
+  }))
+
+  on('command.run', { command: 'back' }, async ($, e) => setAvail($, isPerson(e.origin.kind), parseBack(e.args), '/back')).catch(() => ({
+    text: AVAIL_FAILED_TEXT,
+  }))
+
+  on('command.run', { command: 'ask-user' }, async ($, e) =>
+    setAvail($, isPerson(e.origin.kind), parseAskUser(e.args), '/ask-user'),
+  ).catch(() => ({ text: AVAIL_FAILED_TEXT }))
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     if (!run) return composed
+    const now = await $.clock.now()
+    if (!run) return composed
+    // Read only: compose fires for every model request and for other plugins' $.prompt.compose(),
+    // so it runs no mode effects and reads no file; the records were refreshed at turn.start.
+    const mode = availMode(run, effective(run, sessionAvail, globalAvail), now)
+    // While draining, the role section names the head question: that is the one an answer removes.
+    const head = mode === 'draining' ? drainingQuestion(run) : null
+    if (head && run.askingId !== head.id) {
+      run.askingId = head.id
+      await save($).catch(error => log($, `could not record the asked question: ${String(error)}`).catch(() => undefined))
+      if (!run) return composed
+    }
 
     return {
       sections: [
         ...composed.sections,
-        { id: 'autopilot:role', text: roleSection(run, await $.clock.now()), scope: 'session' as const },
+        { id: 'autopilot:role', text: roleSection(run, now, mode), scope: 'session' as const },
       ],
     }
   })
@@ -730,13 +1366,50 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // The person writing after an away ended starts the drain (R10); during a
+  // drain, their idle prompt is the answer the next turn starts with, but only
+  // once the question was put to them. A prompt from a plugin, a peer, a
+  // notification or the SDK answers nothing.
+  on('prompt.submit', async ($, e, next) => {
+    // Every prompt overwrites the flag: only the one that starts the turn counts.
+    lastSubmitHuman = false
+    // A slash command typed by the person is not a message to the session. (isPerson: task 08's helper.)
+    if (!isPerson(e.origin.kind) || e.text.trimStart().startsWith('/')) return next(e)
+    await syncId($)
+    if (!run) return next(e)
+    const mode = await refreshMode($)
+    if (mode === 'overdue' && run) {
+      run = humanSubmit(run, mode)
+      await save($)
+      await log($, 'the person wrote after the away time: asking the queued questions one by one')
+      await refreshMode($)
+
+      return next(e)
+    }
+    // Typed into a running turn (turnId set) it reaches that turn, not the next one.
+    // Only an answer to a question put to the person counts: while the drain prompt
+    // is still on its way, or the model has not asked yet, nothing leaves the queue
+    // (spec §5.2: no question removed unasked).
+    const awaitsPerson = run?.phase === 'awaiting' && (run.awaiting?.reason === 'user-answer' || run.awaiting?.reason === 'user-input')
+    if (mode === 'draining' && !e.turnId && awaitsPerson) lastSubmitHuman = true
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('turn.start', async ($, e, next) => {
     isTurnRunning = true
     toolsThisTurn = 0
     turnSeq += 1
+    // Read and reset before any await: only the prompt that starts this turn can be the answer.
+    const isAnswer = lastSubmitHuman
+    lastSubmitHuman = false
     await syncId($)
+    // A failed removal must not skip ending the wait below.
+    if (isAnswer) await removeAnswered($).catch(error => log($, `could not remove the answered question: ${String(error)}`).catch(() => undefined))
     // turn.start carries no agentId: it is the main loop's turn.
     await endWait($)
+    // A turn start is a mode-rule trigger (spec §5.1): the wait just ended may change the mode.
+    await refreshMode($)
     await refreshIdentity($)
 
     return next(e)
@@ -749,6 +1422,8 @@ export const register: Register = on => {
       return { deny: 'Only the main session may wait under autopilot; a subagent may not.' }
     }
     await syncId($)
+    // The mode first: everything from the clock read on stays free of awaits until the flip.
+    const mode = await refreshMode($)
     const now = await $.clock.now()
     // Check, parse and flip before the first await: a parallel tool call may move the phase meanwhile.
     if (!run) return { deny: 'Autopilot is not driving right now: no wait needed.' }
@@ -757,10 +1432,18 @@ export const register: Register = on => {
     const isRepeat = run.phase === 'awaiting'
     const parsed = parseWaitInput(e, now, run.until)
     if (parsed.kind === 'error') return { deny: parsed.message }
-    const refusal = waitRefusal(parsed.awaiting, run.askUser === true)
+    const refusal = waitRefusal(parsed.awaiting, mode ?? 'plain')
     if (refusal) {
       await log($, `wait refused (${parsed.awaiting.reason}): ${refusal}`)
       return { deny: refusal }
+    }
+
+    // A drain question asked: "#k" in the note names it, only while k is queued; untagged, the answer removes the question the role section named.
+    if (parsed.awaiting.reason === 'user-answer' || parsed.awaiting.reason === 'user-input') {
+      const questionId = questionIdFromNote(parsed.awaiting.note, run.questions ?? [])
+      if (questionId !== null) parsed.awaiting.questionId = questionId
+      // The drain is under way: a drain prompt still pending would wake this wait and have the question asked twice.
+      if (mode === 'draining') run.pending = (run.pending ?? []).filter(entry => entry.kind !== 'drain')
     }
 
     const previous = { phase: run.phase, awaiting: run.awaiting ?? null }
@@ -787,6 +1470,45 @@ export const register: Register = on => {
       result: `Waiting recorded (${waitText(parsed.awaiting, now)}). End your turn now; any incoming message (another session, a subagent, a workflow, the person) wakes you and autopilot will not nudge you meanwhile.`,
     }
   }).catch(() => ({ deny: 'Autopilot could not record the wait. Continue your work.' }))
+
+  on('tool.call', { tool: FULL_QUEUE_TOOL }, async ($, e) => {
+    // Only the main loop asks the person; a subagent reports to it instead.
+    if (e.agentId) {
+      await log($, `queue refused: called by a subagent (${e.agentId})`)
+      return { deny: 'Only the main session may queue questions for the person under autopilot; a subagent may not.' }
+    }
+    await syncId($)
+    const mode = await refreshMode($)
+    const refusal = queueRefusal(mode)
+    if (refusal) return { deny: refusal }
+    const now = await $.clock.now()
+    // Stopped while the clock was read.
+    if (!run) return { deny: NO_QUEUE_TEXT }
+    if (run.phase === 'final') return { deny: 'Autopilot is finishing this run: do not queue. Put the question in your handoff as an open question for the person.' }
+    const input = parseQueueInput(e)
+    if (typeof input === 'string') return { deny: input }
+
+    // Add and swap before the next await: a parallel call queues after this one, never over it.
+    const added = addQuestion(run, input, now)
+    run = added.run
+    try {
+      await save($)
+    } catch (error) {
+      // Not recorded: take out only this call's question; a parallel call may have queued its own since.
+      if (run && added.isNew) run.questions = (run.questions ?? []).filter(question => question.id !== added.id)
+      await save($).catch(() => undefined)
+      await log($, `could not record the question: ${String(error)}`).catch(() => undefined)
+      return { deny: QUEUE_FAILED_TEXT }
+    }
+    const count = run?.questions?.length ?? 0
+    const meanwhile = input.provisional ? ` · meanwhile: ${input.provisional}` : ''
+    await log($, added.isNew ? `queued #${added.id} (${input.kind}, ${count} waiting): ${input.question}${meanwhile}` : `queue: same as #${added.id}, not added again`)
+    $.ui.toast(added.isNew ? `Autopilot: question #${added.id} queued for you (${count} waiting).` : `Autopilot: question #${added.id} was already queued.`)
+    // Never dropped (D6): past the mark the person only hears how many wait.
+    if (added.warn) $.ui.toast(`Autopilot: ${count} questions are queued (more than ${QUEUE_WARN}); none is dropped. /back to answer them.`)
+
+    return { result: queuedResult(added.id, added.warn, input.cut === true) }
+  }).catch(() => ({ deny: QUEUE_FAILED_TEXT }))
 
   on('tool.call', { tool: FULL_RESTART_TOOL }, async ($, e) => {
     // Only the main loop restarts the session; a subagent never does.
@@ -877,8 +1599,9 @@ export const register: Register = on => {
     // While waiting the person is in control: their questions and refusals are theirs.
     const isAway = autoAnswersQuestions(run.phase)
     if (isAway && e.tool === 'AskUserQuestion') {
+      const mode = await refreshMode($)
       await log($, `question answered by autopilot (decide yourself): ${JSON.stringify(e).slice(0, 400)}`)
-      return { deny: askAnswer(run.askUser === true) }
+      return { deny: askAnswer(mode ?? 'plain') }
     }
 
     const ran = await next(e)
@@ -888,30 +1611,47 @@ export const register: Register = on => {
       return { deny: `${ran.deny}\n\n${DEFERRED_NOTE}` }
     }
 
-    const usage = await $.session.usage().catch(() => null)
-    const percent = usage?.context.percent ?? null
-    const now = await $.clock.now()
+    // What must reach the model (a ping, the drain, a released wait) rides on this result,
+    // but not on wait_for or the restart: both tell the session to end its turn.
+    const isTurnEnding = e.tool === FULL_WAIT_TOOL || e.tool === FULL_RESTART_TOOL
+    const pendingText = isTurnEnding ? null : await flushPending($, 'tool')
+    const pendingContext = pendingText ? [pendingText] : []
 
-    // Token limits come before the context trigger.
-    const limitInstruction = await applyLimits($, usage?.rateLimits ?? [], now)
-    if (limitInstruction) return { ...ran, context: [...(ran.context ?? []), limitInstruction] }
+    // From here on the pending text is taken: a failure below must still hand it to the model.
+    try {
+      const usage = await $.session.usage().catch(() => null)
+      const percent = usage?.context.percent ?? null
+      const now = await $.clock.now()
 
-    // Parallel tool calls finish together: decide and flip the phase with no
-    // await in between, so only the first of them carries the instruction.
-    const action = wrapMidTurn(run, now, percent, ceiling)
-    if (!action) return ran
-    const reason = now >= run.until ? 'time' : 'restarts'
-    run.phase = action === 'wrapup' ? 'wrapping' : 'final'
-    if (action === 'final') {
-      run.finalReason = reason
-      run.finalAt = now
+      // Token limits come before the context trigger.
+      const limitInstruction = await applyLimits($, usage?.rateLimits ?? [], now)
+      if (limitInstruction) return { ...ran, context: [...(ran.context ?? []), ...pendingContext, limitInstruction] }
+
+      // A run that ended during the awaits above gets no instruction; the pending text still goes out.
+      if (!run) return { ...ran, context: [...(ran.context ?? []), ...pendingContext] }
+      // Parallel tool calls finish together: decide and flip the phase with no
+      // await in between, so only the first of them carries the instruction.
+      const action = wrapMidTurn(run, now, percent, ceiling)
+      if (!action) return pendingText ? { ...ran, context: [...(ran.context ?? []), ...pendingContext] } : ran
+      const reason = now >= run.until ? 'time' : 'restarts'
+      run.phase = action === 'wrapup' ? 'wrapping' : 'final'
+      if (action === 'final') {
+        run.finalReason = reason
+        run.finalAt = now
+      }
+      await save($)
+      if (!run) return { ...ran, context: [...(ran.context ?? []), ...pendingContext] }
+      await log($, `${action} requested mid-turn at ${percent ?? '?'}% context (trigger ${effectiveTrigger(run, ceiling)}%)`)
+      if (action === 'final') await clearGoal($)
+      if (!run) return { ...ran, context: [...(ran.context ?? []), ...pendingContext] }
+      const instruction = action === 'wrapup' ? wrapupPrompt(run, percent) : finalPrompt(run, reason)
+
+      return { ...ran, context: [...(ran.context ?? []), ...pendingContext, instruction] }
+    } catch (error) {
+      await log($, `tool.call failed after taking pending prompts: ${String(error)}`).catch(() => undefined)
+
+      return { ...ran, context: [...(ran.context ?? []), ...pendingContext] }
     }
-    await save($)
-    await log($, `${action} requested mid-turn at ${percent ?? '?'}% context (trigger ${effectiveTrigger(run, ceiling)}%)`)
-    if (action === 'final') await clearGoal($)
-    const instruction = action === 'wrapup' ? wrapupPrompt(run, percent) : finalPrompt(run, reason)
-
-    return { ...ran, context: [...(ran.context ?? []), instruction] }
   }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
@@ -973,9 +1713,11 @@ export const register: Register = on => {
     if (action === 'continue') {
       run.idleTurns = calledTools ? 0 : run.idleTurns + 1
       await save($)
+      if (!run) return result
       // With a goal set, its own loop starts the next turn; autopilot only watches.
+      // Otherwise a pending prompt (a ping, the drain) is the next prompt instead of the nudge.
       if (run.goal && isGoalSet) watchGoal($)
-      else queue($, CONTINUE_PROMPT)
+      else if (!(await flushPending($, 'turn'))) queue($, CONTINUE_PROMPT)
     }
     if (action === 'resume-done') {
       run.phase = 'running'
@@ -984,8 +1726,10 @@ export const register: Register = on => {
       await save($)
       await log($, `resumed from the handoff at ${percent ?? '?'}% context; next handoff at ${effectiveTrigger(run, ceiling)}%`)
       // With a goal: setting it again starts the next turn, so no prompt of ours.
+      // Otherwise what waited through the restart goes first.
+      if (!run) return result
       if (run.goal) await setGoal($)
-      else queue($, CONTINUE_PROMPT)
+      else if (!(await flushPending($, 'turn'))) queue($, CONTINUE_PROMPT)
     }
     if (action === 'wrapup') {
       run.phase = 'wrapping'

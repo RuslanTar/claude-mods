@@ -33,6 +33,8 @@ export type Awaiting = {
   timeoutAt: number | null
   /** Whether that check was already sent. */
   pinged: boolean
+  /** In draining: the queued question this wait asks (its note carried `#k` and k was queued). Missing when untagged and in older runs. */
+  questionId?: number
 }
 
 export type FinalReason = 'time' | 'restarts' | 'week' | 'goal' | 'done'
@@ -78,6 +80,20 @@ export type Run = {
   graceSince?: number
   /** For a grace resume: how many times the session was asked again to restart. */
   graceAsks?: number
+  /** Critical questions parked while the person cannot answer (/away, /ask-user off), oldest first. Missing in older runs. */
+  questions?: Question[]
+  /** Whether the queue is being asked one question at a time. */
+  drain?: boolean
+  /** The question the current drain role section names. */
+  askingId?: number
+  /** The id the next queued question gets; only grows, so an id is never reused within the run (spec §3.1). Missing in older runs. */
+  nextQuestionId?: number
+  /** The session away `setAt` whose expiry ping was handed to the model. */
+  pingedFor?: number
+  /** Prompts that must reach the model, kept until delivered (only while running or awaiting). */
+  pending?: Pending[]
+  /** The mode the last heartbeat or command acted on. */
+  lastMode?: Mode
 }
 
 /** A run that finished on time or restarts, kept for a grace period so the person can bring it back. */
@@ -107,3 +123,52 @@ export type Command =
 
 /** A token window as `$.session.usage().rateLimits` reports it. */
 export type TokenWindow = { kind: string; percentUsed: number; resetsAt?: string }
+
+/**
+ * How a run treats questions for the person, decided by availMode in order:
+ * - plain: no --ask-user and no askUser record anywhere; today's no-ask behaviour, no queue
+ * - queueing: asking is off, or the person is away; critical questions go to the queue
+ * - draining: the queue is asked one question at a time
+ * - overdue: the away ended with questions queued; no asking until the person writes
+ * - asking: today's --ask-user behaviour
+ */
+export type Mode = 'plain' | 'queueing' | 'overdue' | 'draining' | 'asking'
+
+export type AwayField = { until: number; setAt: number } | { back: true; setAt: number }
+export type AskField = { on: boolean; setAt: number }
+/** Availability record, session ($.store `away:<sid>`) or global (~/.claude/autopilot/status/global.json). */
+export type Avail = { v: 1; away: AwayField | null; askUser: AskField | null }
+
+export type Effective = {
+  away: AwayField | null
+  awaySource: 'session' | 'global' | null
+  /** Effective ask-user: the record if any, else the run's --ask-user flag. */
+  askOn: boolean
+  /** Whether any level holds an askUser record (D5: no record + flag off = plain). */
+  askRecorded: boolean
+  /** When the effective askUser record was set (session over global); null without one. */
+  askSetAt: number | null
+}
+
+/** A critical question parked for the person; ids run 1..n within the run and are never reused (`Run.nextQuestionId`). */
+export type Question = { id: number; text: string; kind: 'answer' | 'action'; provisional: string | null; at: number }
+export type QueueInput = {
+  question: string
+  kind: 'answer' | 'action'
+  provisional: string | null
+  /** Set when the question or the provisional was longer than its cap and was cut. */
+  cut?: true
+}
+
+/** A prompt that must reach the model; `key` is the away `setAt` for pings, 0 otherwise. */
+export type Pending = { kind: 'ping' | 'combined-ping' | 'drain' | 'continue'; text: string; key: number }
+
+export type AvailCommand =
+  | { kind: 'away'; end: { kind: 'duration'; ms: number } | { kind: 'clock'; hours: number; minutes: number }; global: boolean }
+  | { kind: 'back'; global: boolean }
+  | { kind: 'ask-user'; on: boolean; global: boolean }
+  | { kind: 'error'; message: string }
+
+/** What the combined ping reads from other sessions' badge files. */
+export type BadgeAvail = { queued: number; awaySource: 'session' | 'global' | null; awaySetAt: number | null; beat: number }
+export type LockOwner = { sid: string; at: number }
